@@ -1,11 +1,10 @@
 import { ref as dbRef, onValue, set as dbSet, get, child } from 'firebase/database';
 import { db } from '../firebase/config';
 
-// Số lượng food mong muốn tồn tại trên map tại mọi thời điểm
-const TARGET_FOOD_COUNT = 500;
+// Số lượng food tối đa trên map (giảm để tránh spam dữ liệu)
+const TARGET_FOOD_COUNT = 600; // trước đây là 600
 
-// Kích thước thế giới – nên giữ đồng bộ với WORLD_SIZE trong App.jsx
-const WORLD_SIZE = 4000;
+const WORLD_SIZE = 5000;
 
 // Tạo màu ngẫu nhiên dạng HSL cho dễ nhìn
 const randomColor = () => {
@@ -78,5 +77,5 @@ export const spawnFood = async () => {
 
 // Tuỳ cách bạn muốn dùng:
 // - Có thể import spawnFood vào server mô phỏng hoặc client admin
-// - Và gọi spawnFood định kỳ (ví dụ setInterval) để đảm bảo luôn đủ 1000 food
+// - Và gọi spawnFood định kỳ (ví dụ setInterval) để đảm bảo luôn đủ 600 food
 
