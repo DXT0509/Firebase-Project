@@ -30,6 +30,7 @@ const PUNCH_EXTRA = PLAYER_SIZE * 0.6;
 const PUNCH_DURATION = 200;
 const PUNCH_COOLDOWN = 500;
 const PUNCH_CONVERGENCE = 0.5;
+const KNOCKBACK_Y = 100;
 const FOOD_BASE_RADIUS = 4; // bán kính cơ bản cho food size 1
 
 // Bot & food tick dành riêng cho host (chỉ một client thực thi)
@@ -128,6 +129,7 @@ function App() {
   const nextPunchHand = useRef(0);
   const lastPunchTime = useRef(0);
   const lastPunchHit = useRef({});
+  const lastBotPunchHit = useRef({});
 
   const firebaseClients = useRef({});
   const smoothClients = useRef({});
@@ -622,6 +624,50 @@ function App() {
         ) {
           return;
         }
+
+        // Kiểm tra cú đấm của bot vào bản thân player local
+        if (id.startsWith('bot-')) {
+          const botLeftP = typeof p.leftPunch === 'number' ? p.leftPunch : 0;
+          const botRightP = typeof p.rightPunch === 'number' ? p.rightPunch : 0;
+          const botPunchStamp = typeof p.lastPunchTime === 'number' ? p.lastPunchTime : 0;
+
+          if ((botLeftP > 0 || botRightP > 0) && botPunchStamp > 0) {
+            const handOffsetSide = enemySize * 0.35;
+            const baseForward = enemySize * 0.45;
+            const handRadius = enemySize * 0.175;
+            const myBodyRadius = myRadius;
+            const botAngle = typeof p.angle === 'number' ? p.angle : 0;
+
+            const applyBotHit = () => {
+              if (lastBotPunchHit.current[id] === botPunchStamp) return;
+              lastBotPunchHit.current[id] = botPunchStamp;
+              myWorldPos.current.y = Math.max(0, Math.min(WORLD_SIZE, myWorldPos.current.y + KNOCKBACK_Y));
+            };
+
+            if (botLeftP > 0) {
+              const leftF = baseForward + botLeftP * PUNCH_EXTRA;
+              const leftS = handOffsetSide * (1 - botLeftP * PUNCH_CONVERGENCE);
+              const lxLocal = leftF;
+              const lyLocal = -leftS;
+              const lxWorld = p.x + lxLocal * Math.cos(botAngle) - lyLocal * Math.sin(botAngle);
+              const lyWorld = p.y + lxLocal * Math.sin(botAngle) + lyLocal * Math.cos(botAngle);
+              const dist = Math.hypot(myWorldPos.current.x - lxWorld, myWorldPos.current.y - lyWorld);
+              if (dist < myBodyRadius + handRadius) applyBotHit();
+            }
+
+            if (botRightP > 0) {
+              const rightF = baseForward + botRightP * PUNCH_EXTRA;
+              const rightS = handOffsetSide * (1 - botRightP * PUNCH_CONVERGENCE);
+              const rxLocal = rightF;
+              const ryLocal = rightS;
+              const rxWorld = p.x + rxLocal * Math.cos(botAngle) - ryLocal * Math.sin(botAngle);
+              const ryWorld = p.y + rxLocal * Math.sin(botAngle) + ryLocal * Math.cos(botAngle);
+              const dist = Math.hypot(myWorldPos.current.x - rxWorld, myWorldPos.current.y - ryWorld);
+              if (dist < myBodyRadius + handRadius) applyBotHit();
+            }
+          }
+        }
+
         // Kiểm tra va chạm nắm đấm của mình với player khác
         if (punchHand.current !== null && punchProgress.current > 0) {
           const myLevelForPunch = myLevel;
@@ -640,7 +686,7 @@ function App() {
           const applyHit = () => {
             if (lastPunchHit.current[id] === lastPunchTime.current) return;
             lastPunchHit.current[id] = lastPunchTime.current;
-            p.y += 10; // tạm thời chỉ đẩy Y xuống 10 (client-side)
+            p.y += KNOCKBACK_Y;
 
             // Cập nhật luôn vị trí trên Firebase để mọi client thấy knockback
             const targetNow = firebaseClients.current[id];
@@ -648,7 +694,7 @@ function App() {
               const victimRef = dbRef(db, `clients/${id}`);
               dbSet(victimRef, {
                 ...targetNow,
-                y: targetNow.y + 10,
+                y: Math.max(0, Math.min(WORLD_SIZE, targetNow.y + KNOCKBACK_Y)),
               });
             }
           };
