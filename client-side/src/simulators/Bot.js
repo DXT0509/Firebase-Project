@@ -16,9 +16,71 @@ const ENTITY_BASE_SIZE = 60;
 // Giữ đồng bộ timing punch với player trong App.jsx
 const PUNCH_DURATION = 200;
 const PUNCH_COOLDOWN = 500;
+const PUNCH_COOLDOWN_PER_LEVEL = 60;
 const PUNCH_EXTRA = ENTITY_BASE_SIZE * 0.6;
 const PUNCH_CONVERGENCE = 0.5;
 const BOT_HIT_PUSH_Y = 100;
+
+const EVOWARS_XP_TABLE = [
+	{ level: 1, score: 0 },
+	{ level: 2, score: 100 },
+	{ level: 3, score: 200 },
+	{ level: 4, score: 350 },
+	{ level: 5, score: 500 },
+	{ level: 6, score: 700 },
+	{ level: 7, score: 900 },
+	{ level: 8, score: 1150 },
+	{ level: 9, score: 1400 },
+	{ level: 10, score: 1700 },
+	{ level: 11, score: 2050 },
+	{ level: 12, score: 2400 },
+	{ level: 13, score: 2800 },
+	{ level: 14, score: 3200 },
+	{ level: 15, score: 3700 },
+	{ level: 16, score: 4200 },
+	{ level: 17, score: 4800 },
+	{ level: 18, score: 5400 },
+	{ level: 19, score: 6100 },
+	{ level: 20, score: 6800 },
+	{ level: 21, score: 8200 },
+	{ level: 22, score: 10000 },
+	{ level: 23, score: 12500 },
+	{ level: 24, score: 15500 },
+	{ level: 25, score: 19500 },
+	{ level: 26, score: 24000 },
+	{ level: 27, score: 30000 },
+	{ level: 28, score: 37000 },
+	{ level: 29, score: 46000 },
+	{ level: 30, score: 58000 },
+	{ level: 31, score: 72000 },
+	{ level: 32, score: 90000 },
+	{ level: 33, score: 115000 },
+	{ level: 34, score: 145000 },
+	{ level: 35, score: 180000 },
+	{ level: 36, score: 220000 },
+	{ level: 37, score: 270000 },
+	{ level: 38, score: 330000 },
+	{ level: 39, score: 400000 },
+	{ level: 40, score: 480000 },
+];
+
+const getLevelFromScore = (score) => {
+	if (!Number.isFinite(score) || score <= 0) return 1;
+	let level = 1;
+	for (let i = 0; i < EVOWARS_XP_TABLE.length; i++) {
+		if (score >= EVOWARS_XP_TABLE[i].score) {
+			level = EVOWARS_XP_TABLE[i].level;
+		} else {
+			break;
+		}
+	}
+	return level;
+};
+
+const getBotAttackDelayMs = (score) => {
+	const level = getLevelFromScore(score);
+	return PUNCH_COOLDOWN + PUNCH_COOLDOWN_PER_LEVEL * (level - 1);
+};
 
 // Tiền tố để dễ phân biệt bot với người chơi thật trong Firebase
 const BOT_ID_PREFIX = 'bot-';
@@ -115,9 +177,11 @@ const getBotPunchState = (bot, now) => {
 	let punchStart = typeof bot.punchStart === 'number' ? bot.punchStart : 0;
 	let nextPunchHand = bot.nextPunchHand === 1 ? 1 : 0;
 	let lastPunchTime = typeof bot.lastPunchTime === 'number' ? bot.lastPunchTime : 0;
+	const botScore = typeof bot.score === 'number' ? bot.score : 0;
+	const attackDelayMs = getBotAttackDelayMs(botScore);
 
 	const isPunching = punchStart && now - punchStart < PUNCH_DURATION;
-	if (!isPunching && now - lastPunchTime >= PUNCH_COOLDOWN) {
+	if (!isPunching && now - lastPunchTime >= attackDelayMs) {
 		punchHand = nextPunchHand;
 		punchStart = now;
 		lastPunchTime = now;

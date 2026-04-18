@@ -26,10 +26,16 @@ const TICK_RATE = 120; // ms
 // LERP_FACTOR cao hơn để mượt giữa các lần update thưa hơn (0.25–0.35 được khuyến nghị)
 const LERP_FACTOR = 0.3;
 const PLAYER_SIZE = 60; // kích cỡ cơ bản level 1
-const PUNCH_EXTRA = PLAYER_SIZE * 0.6;
-const PUNCH_DURATION = 200;
-const PUNCH_COOLDOWN = 500;
-const PUNCH_CONVERGENCE = 0.5;
+const SWING_EXTEND_DURATION = 180;
+const SWING_RETURN_DURATION = 180;
+const SWING_TOTAL_DURATION = SWING_EXTEND_DURATION + SWING_RETURN_DURATION;
+const SWING_COOLDOWN = 500; // level 1
+const SWING_COOLDOWN_PER_LEVEL = 60;
+// Góc local của kiếm so với hướng di chuyển.
+// Idle: quay ngược hướng chạy (pi), khi vung quét 180 độ về lại hướng chạy (0)
+// theo cung bên trái của hướng chạy.
+const SWORD_BASE_ANGLE = Math.PI;
+const SWORD_SWEEP_ARC = Math.PI;
 const KNOCKBACK_Y = 100;
 const FOOD_BASE_RADIUS = 4; // bán kính cơ bản cho food size 1
 
@@ -112,6 +118,11 @@ const getSizeFromLevel = (level) => {
   return PLAYER_SIZE + (level-1) * 4;
 };
 
+const getSwingCooldownByLevel = (level) => {
+  const safeLevel = Math.max(1, Number.isFinite(level) ? level : 1);
+  return SWING_COOLDOWN + SWING_COOLDOWN_PER_LEVEL * (safeLevel - 1);
+};
+
 function App() {
   const canvasRef = useRef(null);
   const [renderTrigger, setRenderTrigger] = useState(0);
@@ -119,17 +130,16 @@ function App() {
   // Refs quản lý logic (không gây re-render)
   const myWorldPos = useRef({ x: WORLD_SIZE / 2, y: WORLD_SIZE / 2 });
   const mousePos = useRef({ x: 0, y: 0 });
+  const moveAngle = useRef(0);
   const idRef = useRef(crypto.randomUUID());
   const colorRef = useRef(`hsl(${Math.floor(Math.random() * 360)}, 80%, 50%)`);
 
-  // Animation đấm
-  const punchHand = useRef(null);
-  const punchStart = useRef(0);
-  const punchProgress = useRef(0);
-  const nextPunchHand = useRef(0);
-  const lastPunchTime = useRef(0);
-  const lastPunchHit = useRef({});
-  const lastBotPunchHit = useRef({});
+  // Animation vung kiếm
+  const swingStart = useRef(0);
+  const swingProgress = useRef(0);
+  const lastSwingTime = useRef(0);
+  const lastSwingHit = useRef({});
+  const lastBotSwingHit = useRef({});
 
   const firebaseClients = useRef({});
   const smoothClients = useRef({});
@@ -146,46 +156,132 @@ function App() {
   const boostScoreAccumulator = useRef(0);
   const isHost = useRef(false); // chỉ host mới chạy bot AI + spawn food
 
+  const getSwordWorldPoints = (x, y, weaponAngle, size, swingP) => {
+    const clampedSwing = Math.max(0, Math.min(1, swingP || 0));
+    // Đi theo cung còn lại để quét qua bên tay trái (x-), không quét sang x+
+    const sweep = SWORD_BASE_ANGLE + clampedSwing * SWORD_SWEEP_ARC;
+    const handReach = size * 0.35 + clampedSwing * size * 0.35;
+    const bladeLength = size * 1.0;
+
+    const handLocalX = Math.cos(sweep) * handReach;
+    const handLocalY = Math.sin(sweep) * handReach;
+    const tipLocalX = handLocalX + Math.cos(sweep) * bladeLength;
+    const tipLocalY = handLocalY + Math.sin(sweep) * bladeLength;
+
+    const cosA = Math.cos(weaponAngle);
+    const sinA = Math.sin(weaponAngle);
+
+    return {
+      handX: x + handLocalX * cosA - handLocalY * sinA,
+      handY: y + handLocalX * sinA + handLocalY * cosA,
+      tipX: x + tipLocalX * cosA - tipLocalY * sinA,
+      tipY: y + tipLocalX * sinA + tipLocalY * cosA,
+      impactRadius: size * 0.22,
+    };
+  };
+
   // --- HÀM VẼ NHÂN VẬT TRÊN CANVAS ---
-  const drawPlayer = (ctx, x, y, angle, color, leftP, rightP, label, size) => {
+  const drawPlayer = (ctx, x, y, weaponAngle, color, swingP, label, size) => {
     const bodySize = size || PLAYER_SIZE;
+    const clampedSwing = Math.max(0, Math.min(1, swingP || 0));
+    const sweep = SWORD_BASE_ANGLE + clampedSwing * SWORD_SWEEP_ARC;
+    const handReach = bodySize * 0.35 + clampedSwing * bodySize * 0.35;
+    const bladeLength = bodySize * 1.0;
+    const handSize = bodySize * 0.28;
+    const armStartX = bodySize * 0.12;
+    const armStartY = 0;
+    const handX = Math.cos(sweep) * handReach;
+    const handY = Math.sin(sweep) * handReach;
+    const tipX = handX + Math.cos(sweep) * bladeLength;
+    const tipY = handY + Math.sin(sweep) * bladeLength;
+
     ctx.save();
     ctx.translate(x, y);
-    ctx.rotate(angle);
-
-    const handSize = bodySize * 0.35;
-    const handOffsetSide = bodySize * 0.35;
-    const baseForward = bodySize * 0.45;
-
-    // Tính toán vị trí tay hội tụ về tâm
-    const leftF = baseForward + leftP * PUNCH_EXTRA;
-    const leftS = handOffsetSide * (1 - leftP * PUNCH_CONVERGENCE);
-    const rightF = baseForward + rightP * PUNCH_EXTRA;
-    const rightS = handOffsetSide * (1 - rightP * PUNCH_CONVERGENCE);
+    ctx.rotate(weaponAngle);
 
     ctx.shadowBlur = 10;
     ctx.shadowColor = "rgba(0,0,0,0.3)";
     ctx.shadowOffsetY = 4;
 
-    // Vẽ tay trái
+    // Vẽ thân
     ctx.fillStyle = color;
     ctx.strokeStyle = "white";
     ctx.lineWidth = 3;
     ctx.beginPath();
-    ctx.arc(leftF, -leftS, handSize / 2, 0, Math.PI * 2);
+    ctx.arc(0, 0, bodySize / 2, 0, Math.PI * 2);
     ctx.fill();
     ctx.stroke();
 
-    // Vẽ tay phải
+    // Vẽ 2 mắt theo hướng di chuyển (trục +X sau khi rotate theo weaponAngle)
+    const eyeOffsetForward = bodySize * 0.16;
+    const eyeOffsetSide = bodySize * 0.16;
+    const eyeRadius = bodySize * 0.07;
+    const pupilRadius = Math.max(1.5, bodySize * 0.03);
+    const pupilForward = eyeRadius * 0.35;
+
+    ctx.fillStyle = '#ffffff';
     ctx.beginPath();
-    ctx.arc(rightF, rightS, handSize / 2, 0, Math.PI * 2);
+    ctx.arc(eyeOffsetForward, -eyeOffsetSide, eyeRadius, 0, Math.PI * 2);
+    ctx.arc(eyeOffsetForward, eyeOffsetSide, eyeRadius, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.fillStyle = '#111111';
+    ctx.beginPath();
+    ctx.arc(eyeOffsetForward + pupilForward, -eyeOffsetSide, pupilRadius, 0, Math.PI * 2);
+    ctx.arc(eyeOffsetForward + pupilForward, eyeOffsetSide, pupilRadius, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Vẽ tay cầm kiếm (1 tay)
+    ctx.strokeStyle = 'rgba(255,255,255,0.9)';
+    ctx.lineWidth = Math.max(4, bodySize * 0.09);
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(armStartX, armStartY);
+    ctx.lineTo(handX, handY);
+    ctx.stroke();
+
+    ctx.fillStyle = color;
+    ctx.strokeStyle = 'white';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(handX, handY, handSize / 2, 0, Math.PI * 2);
     ctx.fill();
     ctx.stroke();
 
-    // Vẽ thân
+    // Vẽ kiếm
+    const guardSize = bodySize * 0.22;
+    const hiltLength = bodySize * 0.2;
+    const hiltX = handX - Math.cos(sweep) * hiltLength;
+    const hiltY = handY - Math.sin(sweep) * hiltLength;
+
+    ctx.strokeStyle = '#5a3d1e';
+    ctx.lineWidth = Math.max(4, bodySize * 0.08);
     ctx.beginPath();
-	ctx.arc(0, 0, bodySize / 2, 0, Math.PI * 2);
-    ctx.fill();
+    ctx.moveTo(handX, handY);
+    ctx.lineTo(hiltX, hiltY);
+    ctx.stroke();
+
+    const perpX = -Math.sin(sweep);
+    const perpY = Math.cos(sweep);
+    ctx.strokeStyle = '#c9b037';
+    ctx.lineWidth = Math.max(4, bodySize * 0.07);
+    ctx.beginPath();
+    ctx.moveTo(handX - perpX * guardSize * 0.5, handY - perpY * guardSize * 0.5);
+    ctx.lineTo(handX + perpX * guardSize * 0.5, handY + perpY * guardSize * 0.5);
+    ctx.stroke();
+
+    ctx.strokeStyle = '#f5f5f5';
+    ctx.lineWidth = Math.max(5, bodySize * 0.1);
+    ctx.beginPath();
+    ctx.moveTo(handX, handY);
+    ctx.lineTo(tipX, tipY);
+    ctx.stroke();
+
+    ctx.strokeStyle = '#d6ecff';
+    ctx.lineWidth = Math.max(2, bodySize * 0.04);
+    ctx.beginPath();
+    ctx.moveTo(handX + perpX * 2, handY + perpY * 2);
+    ctx.lineTo(tipX + perpX * 2, tipY + perpY * 2);
     ctx.stroke();
 
     // Vẽ chữ (Xoay ngược lại để chữ luôn thẳng)
@@ -274,11 +370,11 @@ function App() {
     };
     const handleClick = () => {
       const now = Date.now();
-      if ((punchStart.current && now - punchStart.current < PUNCH_DURATION) || (now - lastPunchTime.current < PUNCH_COOLDOWN)) return;
-      punchHand.current = nextPunchHand.current;
-      punchStart.current = now;
-      lastPunchTime.current = now;
-      nextPunchHand.current = nextPunchHand.current === 0 ? 1 : 0;
+      const myLevelNow = getLevelFromScore(myScore.current);
+      const swingCooldownNow = getSwingCooldownByLevel(myLevelNow);
+      if ((swingStart.current && now - swingStart.current < SWING_TOTAL_DURATION) || (now - lastSwingTime.current < swingCooldownNow)) return;
+      swingStart.current = now;
+      lastSwingTime.current = now;
     };
 
     const handleKeyDown = (e) => {
@@ -445,16 +541,29 @@ function App() {
       const dx = mousePos.current.x, dy = mousePos.current.y;
       const dist = Math.hypot(dx, dy);
       if (dist > 10) {
+        moveAngle.current = Math.atan2(dy, dx);
         const currentSpeed = SPEED * speedMultiplier;
         myWorldPos.current.x = Math.max(0, Math.min(WORLD_SIZE, myWorldPos.current.x + (dx / dist) * currentSpeed * dt));
         myWorldPos.current.y = Math.max(0, Math.min(WORLD_SIZE, myWorldPos.current.y + (dy / dist) * currentSpeed * dt));
       }
 
       const now = Date.now();
-      if (punchStart.current) {
-        const t = Math.min(1, (now - punchStart.current) / PUNCH_DURATION);
-        punchProgress.current = t < 0.5 ? t / 0.5 : (1 - t) / 0.5;
-        if (t >= 1) punchStart.current = 0;
+      if (swingStart.current) {
+        const elapsed = now - swingStart.current;
+        const t = Math.min(1, elapsed / SWING_TOTAL_DURATION);
+        if (elapsed <= SWING_EXTEND_DURATION) {
+          // Pha vung ra: 0 -> 1
+          swingProgress.current = elapsed / SWING_EXTEND_DURATION;
+        } else {
+          // Pha rụt về: 1 -> 0
+          const returnElapsed = elapsed - SWING_EXTEND_DURATION;
+          swingProgress.current = Math.max(0, 1 - returnElapsed / SWING_RETURN_DURATION);
+        }
+
+        if (t >= 1) {
+          swingStart.current = 0;
+          swingProgress.current = 0;
+        }
       }
 
       // 2. Nội suy (Lerp) người chơi khác
@@ -466,8 +575,7 @@ function App() {
         // Nếu là người chơi mới, khởi tạo giá trị ban đầu
         smoothClients.current[id] = { 
           ...target, 
-          leftPunch: 0, 
-          rightPunch: 0 
+          swordSwing: 0,
         };
       } else {
         const s = smoothClients.current[id];
@@ -476,18 +584,28 @@ function App() {
         s.x += (target.x - s.x) * LERP_FACTOR;
         s.y += (target.y - s.y) * LERP_FACTOR;
         
-        // --- FIX LAG ĐẤM Ở ĐÂY ---
-        // Thay vì gán s.leftPunch = target.leftPunch, hãy dùng Lerp
-        // Dùng hệ số cao hơn (0.3 - 0.4) để cú đấm phản hồi nhanh nhưng vẫn mượt
+        // Lerp animation vung kiếm
         const PUNCH_LERP = 0.35; 
-        s.leftPunch = (s.leftPunch || 0) + (target.leftPunch - (s.leftPunch || 0)) * PUNCH_LERP;
-        s.rightPunch = (s.rightPunch || 0) + (target.rightPunch - (s.rightPunch || 0)) * PUNCH_LERP;
+        const targetSwordSwing =
+          typeof target.swordSwing === 'number'
+            ? target.swordSwing
+            : Math.max(target.leftPunch || 0, target.rightPunch || 0);
+        s.swordSwing = (s.swordSwing || 0) + (targetSwordSwing - (s.swordSwing || 0)) * PUNCH_LERP;
         
         // Lerp góc quay (Bạn đã có)
         let aDiff = target.angle - (s.angle || 0);
         while (aDiff <= -Math.PI) aDiff += Math.PI * 2;
         while (aDiff > Math.PI) aDiff -= Math.PI * 2;
         s.angle = (s.angle || 0) + aDiff * LERP_FACTOR;
+
+        const targetSwordAngle =
+          typeof target.swordAngle === 'number'
+            ? target.swordAngle
+            : (typeof target.angle === 'number' ? target.angle : 0);
+        let swordDiff = targetSwordAngle - (s.swordAngle || 0);
+        while (swordDiff <= -Math.PI) swordDiff += Math.PI * 2;
+        while (swordDiff > Math.PI) swordDiff -= Math.PI * 2;
+        s.swordAngle = (s.swordAngle || 0) + swordDiff * LERP_FACTOR;
         
         s.color = target.color;
       }
@@ -501,8 +619,8 @@ function App() {
           y: myWorldPos.current.y,
           color: colorRef.current,
           angle,
-          leftPunch: punchHand.current === 0 ? punchProgress.current : 0,
-          rightPunch: punchHand.current === 1 ? punchProgress.current : 0,
+          swordAngle: moveAngle.current,
+          swordSwing: swingProgress.current,
           score: myScore.current,
           boost: boostActive.current,
           lastSeen: now,
@@ -512,13 +630,12 @@ function App() {
         const dxNet = !prev ? Infinity : payload.x - prev.x;
         const dyNet = !prev ? Infinity : payload.y - prev.y;
         const movedFarEnough = !prev || Math.hypot(dxNet, dyNet) > 3; // chỉ gửi nếu dịch chuyển đủ xa
-        const punchChanged =
+        const swingChanged =
           !prev ||
-          prev.leftPunch !== payload.leftPunch ||
-          prev.rightPunch !== payload.rightPunch;
+          prev.swordSwing !== payload.swordSwing;
         const boostChanged = !prev || prev.boost !== payload.boost;
 
-        if (movedFarEnough || punchChanged || boostChanged) {
+        if (movedFarEnough || swingChanged || boostChanged) {
           lastSent.current = now;
           lastSentState.current = payload;
           dbSet(userRef, payload);
@@ -530,6 +647,7 @@ function App() {
       const camX = canvas.width / 2 - myWorldPos.current.x;
       const camY = canvas.height / 2 - myWorldPos.current.y;
       const myAngle = Math.atan2(mousePos.current.y, mousePos.current.x);
+      const mySwordAngle = moveAngle.current;
 
       // --- RENDERING ---
       // Vẽ nền Grid cũ
@@ -560,17 +678,14 @@ function App() {
         const distFood = Math.hypot(dxFood, dyFood);
         if (distFood < radius + myRadius) {
           foodsToRemove.push(foodId);
-          // Cộng điểm theo size của food
           if (size === 1) myScore.current += 8;
           else if (size === 2) myScore.current += 19;
           else myScore.current += 40;
-          return; // Không vẽ nữa vì đã bị ăn
+          return;
         }
 
         const fx = food.x + camX;
         const fy = food.y + camY;
-
-        // Culling: bỏ qua vẽ nếu food nằm ngoài màn hình + margin
         if (
           fx + radius < -VIEW_MARGIN ||
           fx - radius > canvas.width + VIEW_MARGIN ||
@@ -579,12 +694,12 @@ function App() {
         ) {
           return;
         }
+
         ctx.save();
         ctx.fillStyle = food.color || '#ffeb3b';
         ctx.beginPath();
         ctx.arc(fx, fy, radius, 0, Math.PI * 2);
         ctx.fill();
-        // Vẽ thêm 1 dấu gạch ngang trắng bên trong food
         ctx.strokeStyle = 'white';
         ctx.lineWidth = Math.min(3, radius * 0.4);
         ctx.beginPath();
@@ -596,26 +711,29 @@ function App() {
 
       // Xoá các food đã bị ăn khỏi Firebase
       if (foodsToRemove.length > 0) {
-        foodsToRemove.forEach(id => {
+        foodsToRemove.forEach((id) => {
           const fRef = dbRef(db, `food/${id}`);
           dbRemove(fRef);
         });
       }
 
-      // Vẽ người chơi khác (chỉ vẽ các entity nằm trong viewport để giảm draw-call)
+      // Vẽ người chơi khác
       Object.entries(smoothClients.current).forEach(([id, p]) => {
-        if (!firebaseClients.current[id]) { delete smoothClients.current[id]; return; }
+        if (!firebaseClients.current[id]) {
+          delete smoothClients.current[id];
+          return;
+        }
+
         const fbClient = firebaseClients.current[id];
         const enemyScore = typeof fbClient?.score === 'number' ? fbClient.score : 0;
         const enemyLevel = getLevelFromScore(enemyScore);
         const enemySize = getSizeFromLevel(enemyLevel);
+        const enemyRadius = enemySize / 2;
         const enemyName = fbClient?.name || id.slice(0, 3).toUpperCase();
         const enemyLabel = `Lv${enemyLevel} ${enemyName}`;
 
-        // Culling theo vị trí world + viewport
         const ex = p.x + camX;
         const ey = p.y + camY;
-        const enemyRadius = enemySize / 2;
         if (
           ex + enemyRadius < -VIEW_MARGIN ||
           ex - enemyRadius > canvas.width + VIEW_MARGIN ||
@@ -625,106 +743,60 @@ function App() {
           return;
         }
 
-        // Kiểm tra cú đấm của bot vào bản thân player local
+        const enemySwing = typeof p.swordSwing === 'number'
+          ? p.swordSwing
+          : Math.max(p.leftPunch || 0, p.rightPunch || 0);
+        const enemySwordAngle =
+          typeof p.swordAngle === 'number'
+            ? p.swordAngle
+            : (typeof p.angle === 'number' ? p.angle : 0);
+
+        // Bot đập trúng player local
         if (id.startsWith('bot-')) {
-          const botLeftP = typeof p.leftPunch === 'number' ? p.leftPunch : 0;
-          const botRightP = typeof p.rightPunch === 'number' ? p.rightPunch : 0;
-          const botPunchStamp = typeof p.lastPunchTime === 'number' ? p.lastPunchTime : 0;
-
-          if ((botLeftP > 0 || botRightP > 0) && botPunchStamp > 0) {
-            const handOffsetSide = enemySize * 0.35;
-            const baseForward = enemySize * 0.45;
-            const handRadius = enemySize * 0.175;
-            const myBodyRadius = myRadius;
-            const botAngle = typeof p.angle === 'number' ? p.angle : 0;
-
-            const applyBotHit = () => {
-              if (lastBotPunchHit.current[id] === botPunchStamp) return;
-              lastBotPunchHit.current[id] = botPunchStamp;
-              myWorldPos.current.y = Math.max(0, Math.min(WORLD_SIZE, myWorldPos.current.y + KNOCKBACK_Y));
-            };
-
-            if (botLeftP > 0) {
-              const leftF = baseForward + botLeftP * PUNCH_EXTRA;
-              const leftS = handOffsetSide * (1 - botLeftP * PUNCH_CONVERGENCE);
-              const lxLocal = leftF;
-              const lyLocal = -leftS;
-              const lxWorld = p.x + lxLocal * Math.cos(botAngle) - lyLocal * Math.sin(botAngle);
-              const lyWorld = p.y + lxLocal * Math.sin(botAngle) + lyLocal * Math.cos(botAngle);
-              const dist = Math.hypot(myWorldPos.current.x - lxWorld, myWorldPos.current.y - lyWorld);
-              if (dist < myBodyRadius + handRadius) applyBotHit();
-            }
-
-            if (botRightP > 0) {
-              const rightF = baseForward + botRightP * PUNCH_EXTRA;
-              const rightS = handOffsetSide * (1 - botRightP * PUNCH_CONVERGENCE);
-              const rxLocal = rightF;
-              const ryLocal = rightS;
-              const rxWorld = p.x + rxLocal * Math.cos(botAngle) - ryLocal * Math.sin(botAngle);
-              const ryWorld = p.y + rxLocal * Math.sin(botAngle) + ryLocal * Math.cos(botAngle);
-              const dist = Math.hypot(myWorldPos.current.x - rxWorld, myWorldPos.current.y - ryWorld);
-              if (dist < myBodyRadius + handRadius) applyBotHit();
+          const botSwingStamp = typeof p.lastPunchTime === 'number' ? p.lastPunchTime : 0;
+          if (enemySwing > 0 && botSwingStamp > 0) {
+            const botSword = getSwordWorldPoints(p.x, p.y, enemySwordAngle, enemySize, enemySwing);
+            const hitDist = Math.hypot(
+              myWorldPos.current.x - botSword.tipX,
+              myWorldPos.current.y - botSword.tipY,
+            );
+            if (hitDist < myRadius + botSword.impactRadius) {
+              if (lastBotSwingHit.current[id] !== botSwingStamp) {
+                lastBotSwingHit.current[id] = botSwingStamp;
+                myWorldPos.current.y = Math.max(0, Math.min(WORLD_SIZE, myWorldPos.current.y + KNOCKBACK_Y));
+              }
             }
           }
         }
 
-        // Kiểm tra va chạm nắm đấm của mình với player khác
-        if (punchHand.current !== null && punchProgress.current > 0) {
-          const myLevelForPunch = myLevel;
-          const mySizeForPunch = mySize;
-          const baseForward = mySizeForPunch * 0.45;
-          const handOffsetSide = mySizeForPunch * 0.35;
-          const bodyRadius = mySizeForPunch / 2;
-          const handRadius = mySizeForPunch * 0.175; // cùng tỉ lệ với drawPlayer
-
-          const leftP = punchHand.current === 0 ? punchProgress.current : 0;
-          const rightP = punchHand.current === 1 ? punchProgress.current : 0;
-
-          const cx = myWorldPos.current.x;
-          const cy = myWorldPos.current.y;
-
-          const applyHit = () => {
-            if (lastPunchHit.current[id] === lastPunchTime.current) return;
-            lastPunchHit.current[id] = lastPunchTime.current;
-            p.y += KNOCKBACK_Y;
-
-            // Cập nhật luôn vị trí trên Firebase để mọi client thấy knockback
-            const targetNow = firebaseClients.current[id];
-            if (targetNow) {
-              const victimRef = dbRef(db, `clients/${id}`);
-              dbSet(victimRef, {
-                ...targetNow,
-                y: Math.max(0, Math.min(WORLD_SIZE, targetNow.y + KNOCKBACK_Y)),
-              });
+        // Player local chém trúng entity khác
+        if (swingProgress.current > 0) {
+          const mySword = getSwordWorldPoints(
+            myWorldPos.current.x,
+            myWorldPos.current.y,
+            mySwordAngle,
+            mySize,
+            swingProgress.current,
+          );
+          const hitDist = Math.hypot(p.x - mySword.tipX, p.y - mySword.tipY);
+          if (hitDist < enemyRadius + mySword.impactRadius) {
+            if (lastSwingHit.current[id] !== lastSwingTime.current) {
+              lastSwingHit.current[id] = lastSwingTime.current;
+              p.y += KNOCKBACK_Y;
+              const targetNow = firebaseClients.current[id];
+              if (targetNow) {
+                const victimRef = dbRef(db, `clients/${id}`);
+                dbSet(victimRef, {
+                  ...targetNow,
+                  y: Math.max(0, Math.min(WORLD_SIZE, targetNow.y + KNOCKBACK_Y)),
+                });
+              }
             }
-          };
-
-          if (leftP > 0) {
-            const leftF = baseForward + leftP * PUNCH_EXTRA;
-            const leftS = handOffsetSide * (1 - leftP * PUNCH_CONVERGENCE);
-            const lxLocal = leftF;
-            const lyLocal = -leftS;
-            const lxWorld = cx + lxLocal * Math.cos(myAngle) - lyLocal * Math.sin(myAngle);
-            const lyWorld = cy + lxLocal * Math.sin(myAngle) + lyLocal * Math.cos(myAngle);
-            const dist = Math.hypot(p.x - lxWorld, p.y - lyWorld);
-            if (dist < bodyRadius + handRadius) applyHit();
-          }
-
-          if (rightP > 0) {
-            const rightF = baseForward + rightP * PUNCH_EXTRA;
-            const rightS = handOffsetSide * (1 - rightP * PUNCH_CONVERGENCE);
-            const rxLocal = rightF;
-            const ryLocal = rightS;
-            const rxWorld = cx + rxLocal * Math.cos(myAngle) - ryLocal * Math.sin(myAngle);
-            const ryWorld = cy + rxLocal * Math.sin(myAngle) + ryLocal * Math.cos(myAngle);
-            const dist = Math.hypot(p.x - rxWorld, p.y - ryWorld);
-            if (dist < bodyRadius + handRadius) applyHit();
           }
         }
 
-        drawPlayer(ctx, ex, ey, p.angle, p.color, p.leftPunch, p.rightPunch, enemyLabel, enemySize);
+        drawPlayer(ctx, ex, ey, enemySwordAngle, p.color, enemySwing, enemyLabel, enemySize);
 
-        // Hiệu ứng tăng tốc cho player khác nếu họ đang boost
         if (fbClient && fbClient.boost) {
           ctx.save();
           ctx.translate(ex, ey);
@@ -743,9 +815,16 @@ function App() {
 
             // Vẽ bản thân (size theo level)
             const selfLabel = `Lv${myLevel} YOU`;
-            drawPlayer(ctx, canvas.width / 2, canvas.height / 2, myAngle, colorRef.current,
-              punchHand.current === 0 ? punchProgress.current : 0,
-              punchHand.current === 1 ? punchProgress.current : 0, selfLabel, mySize);
+            drawPlayer(
+              ctx,
+              canvas.width / 2,
+              canvas.height / 2,
+              mySwordAngle,
+              colorRef.current,
+              swingProgress.current,
+              selfLabel,
+              mySize,
+            );
 
       // Hiệu ứng tăng tốc quanh nhân vật khi đang boost
       if (boostActive.current) {
@@ -806,6 +885,9 @@ function App() {
   const scoreForBar = Math.max(0, myScoreValue - currScoreForLevel);
   const scoreNeededForBar = Math.max(1, nextScoreForLevel - currScoreForLevel);
   const levelProgress = Math.max(0, Math.min(1, scoreForBar / scoreNeededForBar));
+  const attackCooldownMs = getSwingCooldownByLevel(myLevel);
+  const attackCooldownRemaining = Math.max(0, attackCooldownMs - (Date.now() - lastSwingTime.current));
+  const attackCooldownProgress = attackCooldownMs > 0 ? attackCooldownRemaining / attackCooldownMs : 0;
   let leaderboardRows = [];
 
   if (sortedByScore.length <= 5) {
@@ -867,6 +949,38 @@ function App() {
           />
         </div>
       </div>
+      {/* Attack delay bar: hiển thị khi đang bị khóa đánh thường */}
+      {attackCooldownRemaining > 0 && (
+        <div
+          style={{
+            position: 'absolute',
+            left: '50%',
+            bottom: 92,
+            transform: 'translateX(-50%)',
+            width: 'min(320px, 70vw)',
+            pointerEvents: 'none',
+          }}
+        >
+          <div
+            style={{
+              width: '100%',
+              height: 8,
+              borderRadius: 999,
+              background: 'rgba(255,255,255,0.15)',
+              overflow: 'hidden',
+            }}
+          >
+            <div
+              style={{
+                width: `${attackCooldownProgress * 100}%`,
+                height: '100%',
+                background: 'linear-gradient(90deg, #f59e0b, #ef4444)',
+                transition: 'width 0.08s linear',
+              }}
+            />
+          </div>
+        </div>
+      )}
       {/* Bảng xếp hạng */}
       <div
         style={{
