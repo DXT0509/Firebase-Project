@@ -1,10 +1,6 @@
-import { ref as dbRef, onValue, set as dbSet, get, child } from 'firebase/database';
+import { ref as dbRef, set as dbSet, get } from 'firebase/database';
 import { db } from '../firebase/config';
-
-// Số lượng food tối đa trên map (giảm để tránh spam dữ liệu)
-const TARGET_FOOD_COUNT = 600; // trước đây là 600
-
-const WORLD_SIZE = 5000;
+import { TARGET_FOOD_COUNT, WORLD_SIZE } from '../constants/gameConfig';
 
 // Tạo màu ngẫu nhiên dạng HSL cho dễ nhìn
 const randomColor = () => {

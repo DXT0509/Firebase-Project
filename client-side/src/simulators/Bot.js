@@ -1,89 +1,27 @@
 import { ref as dbRef, get, set as dbSet, remove as dbRemove } from 'firebase/database';
 import { db } from '../firebase/config';
+import {
+	WORLD_SIZE,
+	PUNCH_DURATION,
+	PUNCH_COOLDOWN,
+	PUNCH_COOLDOWN_PER_LEVEL,
+	TARGET_BOT_COUNT,
+	BOT_SPEED,
+	BOT_HIT_PUSH_Y,
+	BOT_ID_PREFIX,
+} from '../constants/gameConfig';
+import { getLevelFromScore, getSizeFromLevel, getSwordWorldPoints } from '../utils/physics';
+import { getPointToSegmentDistance } from '../utils/math';
 
-// Kích thước thế giới – nên giữ đồng bộ với WORLD_SIZE trong App.jsx và Spawn.js
-const WORLD_SIZE = 5000;
+// Lưu timestamp mô phỏng lần trước để tính bước di chuyển theo thời gian thực
+let lastBotSimTs = 0;
 
-// Số lượng bot mong muốn trên map (giảm để tránh spam write & lag)
-const TARGET_BOT_COUNT = 25; // trước đây là 100
-
-// Tốc độ di chuyển cơ bản của bot (đơn vị / tick)
-// Với BOT_UPDATE_INTERVAL_MS ≈ 40ms, BOT_STEP = 12 ~ 300 đơn vị/giây,
-// gần tương đương SPEED của người chơi trong App.jsx → bot chạy nhanh & mượt.
-const BOT_STEP = 12;
-const ENTITY_BASE_SIZE = 60;
-
-// Giữ đồng bộ timing punch với player trong App.jsx
-const PUNCH_DURATION = 200;
-const PUNCH_COOLDOWN = 500;
-const PUNCH_COOLDOWN_PER_LEVEL = 60;
-const PUNCH_EXTRA = ENTITY_BASE_SIZE * 0.6;
-const PUNCH_CONVERGENCE = 0.5;
-const BOT_HIT_PUSH_Y = 100;
-
-const EVOWARS_XP_TABLE = [
-	{ level: 1, score: 0 },
-	{ level: 2, score: 100 },
-	{ level: 3, score: 200 },
-	{ level: 4, score: 350 },
-	{ level: 5, score: 500 },
-	{ level: 6, score: 700 },
-	{ level: 7, score: 900 },
-	{ level: 8, score: 1150 },
-	{ level: 9, score: 1400 },
-	{ level: 10, score: 1700 },
-	{ level: 11, score: 2050 },
-	{ level: 12, score: 2400 },
-	{ level: 13, score: 2800 },
-	{ level: 14, score: 3200 },
-	{ level: 15, score: 3700 },
-	{ level: 16, score: 4200 },
-	{ level: 17, score: 4800 },
-	{ level: 18, score: 5400 },
-	{ level: 19, score: 6100 },
-	{ level: 20, score: 6800 },
-	{ level: 21, score: 8200 },
-	{ level: 22, score: 10000 },
-	{ level: 23, score: 12500 },
-	{ level: 24, score: 15500 },
-	{ level: 25, score: 19500 },
-	{ level: 26, score: 24000 },
-	{ level: 27, score: 30000 },
-	{ level: 28, score: 37000 },
-	{ level: 29, score: 46000 },
-	{ level: 30, score: 58000 },
-	{ level: 31, score: 72000 },
-	{ level: 32, score: 90000 },
-	{ level: 33, score: 115000 },
-	{ level: 34, score: 145000 },
-	{ level: 35, score: 180000 },
-	{ level: 36, score: 220000 },
-	{ level: 37, score: 270000 },
-	{ level: 38, score: 330000 },
-	{ level: 39, score: 400000 },
-	{ level: 40, score: 480000 },
-];
-
-const getLevelFromScore = (score) => {
-	if (!Number.isFinite(score) || score <= 0) return 1;
-	let level = 1;
-	for (let i = 0; i < EVOWARS_XP_TABLE.length; i++) {
-		if (score >= EVOWARS_XP_TABLE[i].score) {
-			level = EVOWARS_XP_TABLE[i].level;
-		} else {
-			break;
-		}
-	}
-	return level;
-};
 
 const getBotAttackDelayMs = (score) => {
 	const level = getLevelFromScore(score);
 	return PUNCH_COOLDOWN + PUNCH_COOLDOWN_PER_LEVEL * (level - 1);
 };
 
-// Tiền tố để dễ phân biệt bot với người chơi thật trong Firebase
-const BOT_ID_PREFIX = 'bot-';
 
 // Tạo màu ngẫu nhiên dạng HSL cho bot
 const randomColor = () => {
@@ -159,6 +97,8 @@ const createBotPayload = (x, y) => {
 		y,
 		color: randomColor(),
 		angle: 0,
+		swordAngle: 0,
+		swordSwing: 0,
 		leftPunch: 0,
 		rightPunch: 0,
 		punchHand: 0,
@@ -201,6 +141,7 @@ const getBotPunchState = (bot, now) => {
 	return {
 		leftPunch: punchHand === 0 ? punchProgress : 0,
 		rightPunch: punchHand === 1 ? punchProgress : 0,
+		swordSwing: punchProgress,
 		punchHand,
 		punchStart,
 		nextPunchHand,
@@ -208,44 +149,50 @@ const getBotPunchState = (bot, now) => {
 	};
 };
 
+const withBotCombatPose = (bot, angle, punchState) => {
+	return {
+		...bot,
+		...punchState,
+		swordAngle: angle,
+		swordSwing: typeof punchState.swordSwing === 'number'
+			? punchState.swordSwing
+			: Math.max(punchState.leftPunch || 0, punchState.rightPunch || 0),
+	};
+};
+
 const clampWorld = (value) => Math.max(0, Math.min(WORLD_SIZE, value));
 
-const getEntitySize = () => ENTITY_BASE_SIZE;
+const isSwordSegmentHit = (attacker, target) => {
+	if (!attacker || !target) return false;
+	if (
+		typeof attacker.x !== 'number' ||
+		typeof attacker.y !== 'number' ||
+		typeof target.x !== 'number' ||
+		typeof target.y !== 'number'
+	) {
+		return false;
+	}
 
-const isPunchHit = (attacker, target, leftPunch, rightPunch) => {
-	const attackerSize = getEntitySize(attacker);
-	const targetSize = getEntitySize(target);
-	const handOffsetSide = attackerSize * 0.35;
-	const baseForward = attackerSize * 0.45;
-	const handRadius = attackerSize * 0.175;
+	const swingProgress = Math.max(0, Math.min(1, Number(attacker.swordSwing) || 0));
+	if (swingProgress <= 0) return false;
+
+	const attackerScore = Number.isFinite(attacker.score) ? attacker.score : 0;
+	const targetScore = Number.isFinite(target.score) ? target.score : 0;
+	const attackerSize = getSizeFromLevel(getLevelFromScore(attackerScore));
+	const targetSize = getSizeFromLevel(getLevelFromScore(targetScore));
+	const swordAngle = typeof attacker.swordAngle === 'number' ? attacker.swordAngle : (typeof attacker.angle === 'number' ? attacker.angle : 0);
+	const sword = getSwordWorldPoints(attacker.x, attacker.y, swordAngle, attackerSize, swingProgress, 'left');
+	const distanceToBlade = getPointToSegmentDistance(
+		target.x,
+		target.y,
+		sword.handX,
+		sword.handY,
+		sword.tipX,
+		sword.tipY,
+	);
 	const targetBodyRadius = targetSize / 2;
-	const angle = typeof attacker.angle === 'number' ? attacker.angle : 0;
 
-	if (leftPunch > 0) {
-		const leftF = baseForward + leftPunch * PUNCH_EXTRA;
-		const leftS = handOffsetSide * (1 - leftPunch * PUNCH_CONVERGENCE);
-		const lxLocal = leftF;
-		const lyLocal = -leftS;
-		const lxWorld = attacker.x + lxLocal * Math.cos(angle) - lyLocal * Math.sin(angle);
-		const lyWorld = attacker.y + lxLocal * Math.sin(angle) + lyLocal * Math.cos(angle);
-		if (Math.hypot(target.x - lxWorld, target.y - lyWorld) < targetBodyRadius + handRadius) {
-			return true;
-		}
-	}
-
-	if (rightPunch > 0) {
-		const rightF = baseForward + rightPunch * PUNCH_EXTRA;
-		const rightS = handOffsetSide * (1 - rightPunch * PUNCH_CONVERGENCE);
-		const rxLocal = rightF;
-		const ryLocal = rightS;
-		const rxWorld = attacker.x + rxLocal * Math.cos(angle) - ryLocal * Math.sin(angle);
-		const ryWorld = attacker.y + rxLocal * Math.sin(angle) + ryLocal * Math.cos(angle);
-		if (Math.hypot(target.x - rxWorld, target.y - ryWorld) < targetBodyRadius + handRadius) {
-			return true;
-		}
-	}
-
-	return false;
+	return distanceToBlade <= targetBodyRadius + sword.impactRadius;
 };
 
 // Hàm chính: đảm bảo map có đúng 100 bot
@@ -341,6 +288,10 @@ export const updateBotsTowardFood = async (allClientsOverride, allFoodOverride) 
 	if (!botEntries.length) return;
 
 	const now = Date.now();
+	if (!lastBotSimTs) lastBotSimTs = now;
+	const simDt = Math.max(0.016, (now - lastBotSimTs) / 1000); // tối thiểu ~1 frame
+	lastBotSimTs = now;
+	const botStep = BOT_SPEED * simDt;
 	const updatedBots = { ...botClients };
 	const foodsToRemove = [];
 	const hasFood = Object.keys(allFood).length > 0;
@@ -349,18 +300,17 @@ export const updateBotsTowardFood = async (allClientsOverride, allFoodOverride) 
 		// Không có food thì vẫn di chuyển nhẹ + spam punch theo cooldown player
 		Object.entries(botClients).forEach(([id, bot]) => {
 			const angle = Math.random() * Math.PI * 2;
-			const nx = Math.max(0, Math.min(WORLD_SIZE, bot.x + Math.cos(angle) * 5));
-			const ny = Math.max(0, Math.min(WORLD_SIZE, bot.y + Math.sin(angle) * 5));
+			const nx = Math.max(0, Math.min(WORLD_SIZE, bot.x + Math.cos(angle) * botStep));
+			const ny = Math.max(0, Math.min(WORLD_SIZE, bot.y + Math.sin(angle) * botStep));
 			const punchState = getBotPunchState(bot, now);
 
-			updatedBots[id] = {
+			updatedBots[id] = withBotCombatPose({
 				...bot,
 				x: nx,
 				y: ny,
 				angle,
 				lastSeen: now,
-				...punchState,
-			};
+			}, angle, punchState);
 		});
 	}
 
@@ -371,18 +321,17 @@ export const updateBotsTowardFood = async (allClientsOverride, allFoodOverride) 
 		if (!nearest) {
 			// fallback: di chuyển random
 			const angle = Math.random() * Math.PI * 2;
-			const nx = bot.x + Math.cos(angle) * 5;
-			const ny = bot.y + Math.sin(angle) * 5;
+			const nx = bot.x + Math.cos(angle) * botStep;
+			const ny = bot.y + Math.sin(angle) * botStep;
 			const punchState = getBotPunchState(bot, now);
 
-			updatedBots[id] = {
+			updatedBots[id] = withBotCombatPose({
 				...bot,
 				x: nx,
 				y: ny,
 				angle,
 				lastSeen: now,
-				...punchState,
-			};
+			}, angle, punchState);
 			return;
 		}
 
@@ -394,20 +343,19 @@ export const updateBotsTowardFood = async (allClientsOverride, allFoodOverride) 
 		if (!dist) {
 			// Tránh đứng im: khi trùng đúng tọa độ food thì vẫn random nhẹ
 			const angle = Math.random() * Math.PI * 2;
-			const nx = clampWorld(bot.x + Math.cos(angle) * 3);
-			const ny = clampWorld(bot.y + Math.sin(angle) * 3);
-			updatedBots[id] = {
+			const nx = clampWorld(bot.x + Math.cos(angle) * botStep);
+			const ny = clampWorld(bot.y + Math.sin(angle) * botStep);
+			updatedBots[id] = withBotCombatPose({
 				...bot,
 				x: nx,
 				y: ny,
 				angle,
 				lastSeen: now,
-				...punchState,
-			};
+			}, angle, punchState);
 			return;
 		}
 
-		const step = Math.min(BOT_STEP, dist); // không overshoot
+		const step = Math.min(botStep, dist); // không overshoot
 		let nx = bot.x + (dx / dist) * step;
 		let ny = bot.y + (dy / dist) * step;
 		nx = clampWorld(nx);
@@ -415,7 +363,7 @@ export const updateBotsTowardFood = async (allClientsOverride, allFoodOverride) 
 		const angle = Math.atan2(dy, dx);
 
 		// Nếu sau bước di chuyển này bot gần food đủ để coi như ăn
-		const willReachFood = dist <= BOT_STEP + 2;
+		const willReachFood = dist <= botStep + 2;
 		let newScore = typeof bot.score === 'number' ? bot.score : 0;
 		if (willReachFood && foodId && allFood[foodId]) {
 			const size = allFood[foodId].size || 1;
@@ -428,26 +376,24 @@ export const updateBotsTowardFood = async (allClientsOverride, allFoodOverride) 
 			foodsToRemove.push(foodId);
 		}
 
-		updatedBots[id] = {
+		updatedBots[id] = withBotCombatPose({
 			...bot,
 			x: nx,
 			y: ny,
 			angle,
 			lastSeen: now,
 			score: newScore,
-			...punchState,
-		};
+		}, angle, punchState);
 	});
 
-	// Bot punch hit detection: bot có thể đấm trúng player hoặc bot khác
+	// Bot sword hit detection: bot có thể chém trúng player hoặc bot khác
 	const projectedClients = { ...allClients, ...updatedBots };
 	const yPushById = {};
 
 	Object.entries(updatedBots).forEach(([attackerId, attacker]) => {
 		if (!attacker || typeof attacker.x !== 'number' || typeof attacker.y !== 'number') return;
-		const leftPunch = typeof attacker.leftPunch === 'number' ? attacker.leftPunch : 0;
-		const rightPunch = typeof attacker.rightPunch === 'number' ? attacker.rightPunch : 0;
-		if (leftPunch <= 0 && rightPunch <= 0) return;
+		const swordSwing = typeof attacker.swordSwing === 'number' ? attacker.swordSwing : 0;
+		if (swordSwing <= 0) return;
 
 		const hitMemo = attacker.lastPunchHit && typeof attacker.lastPunchHit === 'object'
 			? { ...attacker.lastPunchHit }
@@ -459,7 +405,7 @@ export const updateBotsTowardFood = async (allClientsOverride, allFoodOverride) 
 			if (!target || typeof target.x !== 'number' || typeof target.y !== 'number') return;
 			if (hitMemo[targetId] === punchStamp) return;
 
-			if (isPunchHit(attacker, target, leftPunch, rightPunch)) {
+			if (isSwordSegmentHit(attacker, target)) {
 				hitMemo[targetId] = punchStamp;
 				yPushById[targetId] = (yPushById[targetId] || 0) + BOT_HIT_PUSH_Y;
 			}
