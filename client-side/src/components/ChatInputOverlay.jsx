@@ -1,5 +1,24 @@
+/**
+ * Purpose:
+ * - Render floating chat input above the canvas.
+ *
+ * Responsibilities:
+ * - Provide controlled input surface for room chat submission.
+ *
+ * Key concepts:
+ * - Uses `pointerEvents` layering so only input receives interactions.
+ */
 import React from 'react';
 
+/**
+ * Inputs:
+ * - value: current draft value.
+ * - onChange: input change handler.
+ * - inputRef: forwarded input ref for focus management.
+ *
+ * Output:
+ * - JSX overlay node.
+ */
 function ChatInputOverlay({ value, onChange, inputRef }) {
   return (
     <div

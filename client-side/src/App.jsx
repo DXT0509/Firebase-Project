@@ -1,3 +1,17 @@
+/**
+ * Purpose:
+ * - Main gameplay container orchestrating input, simulation loops, network writes, and rendering.
+ *
+ * Responsibilities:
+ * - Manage local player state and interaction handlers.
+ * - Coordinate host-only world simulation tasks (food + bots).
+ * - Render world + entities to canvas and drive UI overlays.
+ *
+ * Key concepts:
+ * - Local gameplay is immediate; remote state flows through `useGameSync`.
+ * - Host ownership controls authoritative bot and food simulation.
+ * - Render loop and network sender loop are intentionally decoupled.
+ */
 import React, { useEffect, useRef, useState } from 'react';
 // Firebase Realtime Database (modular v9)
 // NOTE: we intentionally use child-based listeners to avoid reloading whole trees.
@@ -5,6 +19,7 @@ import {
   ref as dbRef,
   push as dbPush,
   set as dbSet,
+  update as dbUpdate,
   get as dbGet,
   remove as dbRemove,
   onDisconnect,
@@ -35,7 +50,7 @@ import {
   getSwordWorldPoints,
   checkCollision,
 } from './utils/physics';
-import { getAngle, getPointToSegmentDistance } from './utils/math';
+import { getAngle, getPointToSegmentDistance, normalizeAngle } from './utils/math';
 import { drawPlayer, drawAttackCooldownUnderLabel } from './renderer/playerRenderer';
 import { drawGrid, drawFood } from './renderer/worldRenderer';
 import { useGameSync } from './hooks/useGameSync';
@@ -44,6 +59,9 @@ import GameHud from './components/GameHud';
 import RoomChatBox from './components/RoomChatBox';
 import ChatInputOverlay from './components/ChatInputOverlay';
 import { getRoomCollectionPath } from './firebase/paths';
+import EmoteWheel from './components/EmoteWheel';
+import { EMOTE_OPTIONS, EMOTE_DURATION_MS, getEmoteById } from './constants/emotes';
+import { drawEmoteBubble } from './renderer/playerRenderer';
 
 function App() {
   const canvasRef = useRef(null);
@@ -51,6 +69,9 @@ function App() {
   const [renderTrigger, setRenderTrigger] = useState(0);
   const [isChatInputOpen, setIsChatInputOpen] = useState(false);
   const [chatDraft, setChatDraft] = useState('');
+  const [isEmoteWheelOpen, setIsEmoteWheelOpen] = useState(false);
+  const [emoteWheelCenter, setEmoteWheelCenter] = useState(null);
+  const [emoteHoveredIndex, setEmoteHoveredIndex] = useState(-1);
   const roomId = DEFAULT_ROOM_ID;
 
   // Refs quản lý logic (không gây re-render)
@@ -81,9 +102,16 @@ function App() {
   const lastUiRefresh = useRef(0);
   const chatInputOpenRef = useRef(false);
   const chatDraftRef = useRef('');
+  const mouseScreenPos = useRef({ x: 0, y: 0 });
+  const emoteWheelOpenRef = useRef(false);
+  const emoteWheelHoveredRef = useRef(-1);
+  const emoteWheelCenterRef = useRef(null);
+  const activeEmoteRef = useRef(null);
+  const activeEmoteUntilRef = useRef(0);
 
-  const { smoothClients, foodItems, chatMessages } = useGameSync(roomId, idRef.current);
+  const { smoothClients, foodItems, chatMessages, rawClients, rawFoodItems } = useGameSync(roomId, idRef.current);
 
+  // Keep chat input focus behavior deterministic across open/close cycles.
   useEffect(() => {
     chatInputOpenRef.current = isChatInputOpen;
     if (isChatInputOpen && chatInputRef.current) {
@@ -92,6 +120,7 @@ function App() {
     }
   }, [isChatInputOpen, chatDraft.length]);
 
+  // Mirror chat draft into ref so keyboard handler always reads latest value.
   useEffect(() => {
     chatDraftRef.current = chatDraft;
   }, [chatDraft]);
@@ -100,6 +129,7 @@ function App() {
     const canvas = canvasRef.current;
     const ctx = canvas.getContext('2d');
 
+    /** Inputs: none. Output: resizes canvas to viewport bounds. */
     const handleResize = () => {
       canvas.width = window.innerWidth;
       canvas.height = window.innerHeight;
@@ -107,10 +137,79 @@ function App() {
     window.addEventListener('resize', handleResize);
     handleResize();
 
-    const handleMouseMove = (e) => {
-      mousePos.current = { x: e.clientX - canvas.width / 2, y: e.clientY - canvas.height / 2 };
+    /**
+     * Input: selected emote id.
+     * Output: none (writes emote state to room client node).
+     */
+    const publishEmote = (emoteId) => {
+      if (!emoteId) return;
+      const now = Date.now();
+      activeEmoteRef.current = emoteId;
+      activeEmoteUntilRef.current = now + EMOTE_DURATION_MS;
+      dbUpdate(dbRef(db, `${getRoomCollectionPath(roomId, 'clients')}/${idRef.current}`), {
+        activeEmote: emoteId,
+        emoteAt: now,
+        emoteUntil: activeEmoteUntilRef.current,
+      }).catch((err) => {
+        console.error('publish emote error', err);
+      });
     };
-    const handleClick = () => {
+
+    /**
+     * Inputs: cursor position in screen space.
+     * Output: hovered wedge index or -1 when outside valid ring.
+     */
+    const getHoveredEmoteIndex = (clientX, clientY) => {
+      const center = emoteWheelCenterRef.current;
+      if (!center) return -1;
+      const dx = clientX - center.x;
+      const dy = clientY - center.y;
+      const dist = Math.hypot(dx, dy);
+      if (dist < 28) return -1;
+      const angle = Math.atan2(dy, dx);
+      const rotated = angle + Math.PI / 2;
+      const normalized = (rotated + Math.PI * 2) % (Math.PI * 2);
+      const slice = (Math.PI * 2) / EMOTE_OPTIONS.length;
+      return Math.floor((normalized + slice / 2) / slice) % EMOTE_OPTIONS.length;
+    };
+
+    /** Input: mouse event. Output: updates aim and wheel hover state. */
+    const handleMouseMove = (e) => {
+      mouseScreenPos.current = { x: e.clientX, y: e.clientY };
+      mousePos.current = { x: e.clientX - canvas.width / 2, y: e.clientY - canvas.height / 2 };
+
+      if (emoteWheelOpenRef.current) {
+        const hoveredIndexNow = getHoveredEmoteIndex(e.clientX, e.clientY);
+        if (hoveredIndexNow !== emoteWheelHoveredRef.current) {
+          emoteWheelHoveredRef.current = hoveredIndexNow;
+          setEmoteHoveredIndex(hoveredIndexNow);
+        }
+      }
+    };
+
+    /**
+     * Input: mouse event.
+     * Output: opens emote wheel (RMB) or starts local sword swing (LMB).
+     *
+     * Critical rule:
+     * - Respect cooldown checks here to keep attack timing authoritative.
+     */
+    const handleMouseDown = (e) => {
+      if (e.button === 2) {
+        e.preventDefault();
+        if (chatInputOpenRef.current) return;
+        emoteWheelOpenRef.current = true;
+        emoteWheelCenterRef.current = { x: e.clientX, y: e.clientY };
+        emoteWheelHoveredRef.current = -1;
+        setIsEmoteWheelOpen(true);
+        setEmoteWheelCenter({ x: e.clientX, y: e.clientY });
+        setEmoteHoveredIndex(-1);
+        return;
+      }
+
+      if (e.button !== 0) return;
+      if (emoteWheelOpenRef.current) return;
+
       const now = Date.now();
       const myLevelNow = getLevelFromScore(myScore.current);
       const swingCooldownNow = getAttackDelayByLevel(myLevelNow);
@@ -119,6 +218,31 @@ function App() {
       lastSwingTime.current = now;
     };
 
+    /** Input: mouse event. Output: commits hovered emote on RMB release. */
+    const handleMouseUp = (e) => {
+      if (e.button === 2 && emoteWheelOpenRef.current) {
+        const selectedIndex = emoteWheelHoveredRef.current;
+        if (selectedIndex >= 0) {
+          publishEmote(EMOTE_OPTIONS[selectedIndex].id);
+        }
+        emoteWheelOpenRef.current = false;
+        emoteWheelCenterRef.current = null;
+        emoteWheelHoveredRef.current = -1;
+        setIsEmoteWheelOpen(false);
+        setEmoteWheelCenter(null);
+        setEmoteHoveredIndex(-1);
+      }
+    };
+
+    /** Input: context menu event. Output: prevent browser menu during gameplay. */
+    const handleContextMenu = (e) => {
+      e.preventDefault();
+    };
+
+    /**
+     * Input: keyboard event.
+     * Output: handles chat toggle/send, modal escapes, and boost key state.
+     */
     const handleKeyDown = (e) => {
       if (e.key === 'Enter' && !e.repeat) {
         e.preventDefault();
@@ -154,13 +278,25 @@ function App() {
         return;
       }
 
-      if (chatInputOpenRef.current) return;
+      if (e.key === 'Escape' && emoteWheelOpenRef.current) {
+        e.preventDefault();
+        emoteWheelOpenRef.current = false;
+        emoteWheelCenterRef.current = null;
+        emoteWheelHoveredRef.current = -1;
+        setIsEmoteWheelOpen(false);
+        setEmoteWheelCenter(null);
+        setEmoteHoveredIndex(-1);
+        return;
+      }
+
+      if (chatInputOpenRef.current || emoteWheelOpenRef.current) return;
 
       if (e.key === 'Shift') {
         shiftPressed.current = true;
       }
     };
 
+    /** Input: keyboard event. Output: releases boost key state. */
     const handleKeyUp = (e) => {
       if (e.key === 'Shift') {
         shiftPressed.current = false;
@@ -168,25 +304,41 @@ function App() {
     };
 
     window.addEventListener('mousemove', handleMouseMove);
-    window.addEventListener('mousedown', handleClick);
+    window.addEventListener('mousedown', handleMouseDown);
+    window.addEventListener('mouseup', handleMouseUp);
     window.addEventListener('keydown', handleKeyDown);
     window.addEventListener('keyup', handleKeyUp);
+    window.addEventListener('contextmenu', handleContextMenu);
 
     // Firebase
-    const userRef = dbRef(db, `clients/${idRef.current}`);
-    const hostRef = dbRef(db, 'host');
+    const clientsPath = getRoomCollectionPath(roomId, 'clients');
+    const userRef = dbRef(db, `${clientsPath}/${idRef.current}`);
+    const hostRef = dbRef(db, getRoomCollectionPath(roomId, 'host'));
+    const clientsRootRef = dbRef(db, clientsPath);
 
     // Xoá client của mình khi disconnect để tránh rác dữ liệu
     onDisconnect(userRef).remove();
 
-    // --- Simple host detection: client đầu tiên đặt /host trở thành host ---
-    // Các client còn lại chỉ đọc dữ liệu, KHÔNG chạy bot logic.
+    /**
+     * Input: none.
+     * Output: none (may claim host role in DB if missing/stale).
+     *
+     * Critical rule:
+     * - Host election heartbeat must stay resilient; bot/food simulation depends on it.
+     */
     const claimHostIfFree = async () => {
       try {
-        const snap = await dbGet(hostRef);
-        const current = snap.val();
-        if (!current || !current.id) {
-          await dbSet(hostRef, { id: idRef.current, ts: Date.now() });
+        const now = Date.now();
+        const [hostSnap, clientsSnap] = await Promise.all([dbGet(hostRef), dbGet(clientsRootRef)]);
+        const current = hostSnap.val();
+        const clients = clientsSnap.val() || {};
+
+        const hostMissing = !current || !current.id;
+        const hostClientMissing = current?.id ? !clients[current.id] : true;
+        const hostStale = typeof current?.ts === 'number' ? now - current.ts > 15000 : true;
+
+        if (hostMissing || hostClientMissing || hostStale) {
+          await dbSet(hostRef, { id: idRef.current, ts: now });
           isHost.current = true;
           // Tự giải phóng role host khi tab bị đóng
           onDisconnect(hostRef).remove();
@@ -203,21 +355,74 @@ function App() {
 
     // Định kỳ vài giây kiểm tra nếu hiện tại không có host
     const hostPoll = setInterval(() => {
-      if (isHost.current) return;
+      if (isHost.current && document.visibilityState === 'visible') {
+        dbSet(hostRef, { id: idRef.current, ts: Date.now() }).catch((err) => {
+          console.error('host heartbeat error', err);
+        });
+      }
+      // Always re-check host ownership so hidden/stale host tabs can be replaced.
       claimHostIfFree();
     }, 5000);
 
+    // Performance-sensitive sender loop: keep network updates independent from render throttling.
+    const networkPoll = setInterval(() => {
+      const now = Date.now();
+      const angle = Math.atan2(mousePos.current.y, mousePos.current.x);
+      const payload = {
+        x: myWorldPos.current.x,
+        y: myWorldPos.current.y,
+        color: colorRef.current,
+        angle,
+        swordAngle: moveAngle.current,
+        swordSwing: swingProgress.current,
+        score: myScore.current,
+        boost: boostActive.current,
+        lastSeen: now,
+        activeEmote: activeEmoteRef.current,
+        emoteAt: activeEmoteRef.current ? Math.max(0, activeEmoteUntilRef.current - EMOTE_DURATION_MS) : 0,
+        emoteUntil: activeEmoteRef.current ? activeEmoteUntilRef.current : 0,
+      };
+
+      const prev = lastSentState.current;
+      const dxNet = !prev ? Infinity : payload.x - prev.x;
+      const dyNet = !prev ? Infinity : payload.y - prev.y;
+      const movedFarEnough = !prev || Math.hypot(dxNet, dyNet) > 2;
+      const angleChanged = !prev || Math.abs(normalizeAngle((payload.angle || 0) - (prev.angle || 0))) > 0.05;
+      const swordAngleChanged = !prev || Math.abs(normalizeAngle((payload.swordAngle || 0) - (prev.swordAngle || 0))) > 0.06;
+      const swingChanged = !prev || Math.abs((payload.swordSwing || 0) - (prev.swordSwing || 0)) > 0.04;
+      const boostChanged = !prev || prev.boost !== payload.boost;
+      const scoreChanged = !prev || prev.score !== payload.score;
+      const emoteChanged = !prev || prev.activeEmote !== payload.activeEmote || prev.emoteUntil !== payload.emoteUntil;
+      const heartbeatDue = !prev || now - lastSent.current > 700;
+
+      if (movedFarEnough || angleChanged || swordAngleChanged || swingChanged || boostChanged || scoreChanged || emoteChanged || heartbeatDue) {
+        lastSent.current = now;
+        lastSentState.current = payload;
+        dbUpdate(userRef, payload).catch((err) => {
+          console.error('network sync error', err);
+        });
+      }
+    }, 50);
+
+    /**
+     * Input: RAF timestamp.
+     * Output: none (advances local simulation and renders current frame).
+     *
+     * Critical rules:
+     * - Host-only block must remain host-gated.
+     * - Rendering and hit checks rely on same geometry helpers used by simulation.
+     */
     const gameLoop = (ts) => {
       // --- HOST-ONLY LOGIC: bot AI + food spawn ---
       if (isHost.current) {
         if (!lastFoodSpawn.current || ts - lastFoodSpawn.current > FOOD_SPAWN_INTERVAL_MS) {
           lastFoodSpawn.current = ts;
-          spawnFood().catch((err) => console.error('spawnFood error', err));
+          spawnFood(roomId).catch((err) => console.error('spawnFood error', err));
         }
 
         if (!lastEnsureBots.current || ts - lastEnsureBots.current > BOT_ENSURE_INTERVAL_MS) {
           lastEnsureBots.current = ts;
-          ensureBots().catch((err) => {
+          ensureBots(roomId).catch((err) => {
             console.error('ensureBots error', err);
           });
         }
@@ -225,8 +430,8 @@ function App() {
         // Tick bot: cho bot di chuyển kiếm food gần nhất với tần suất thấp hơn
         if (!lastBotUpdate.current || ts - lastBotUpdate.current > BOT_UPDATE_INTERVAL_MS) {
           lastBotUpdate.current = ts;
-          // Truyền cache từ hook vào bot AI để tránh get() mỗi tick.
-          updateBotsTowardFood(smoothClients.current, foodItems.current).catch((err) =>
+          // Dùng raw snapshot (authoritative) cho simulation; smooth cache chỉ dành cho render.
+          updateBotsTowardFood(rawClients.current, rawFoodItems.current, roomId).catch((err) =>
             console.error('updateBotsTowardFood error', err),
           );
         }
@@ -272,7 +477,20 @@ function App() {
         myWorldPos.current.y = Math.max(0, Math.min(WORLD_SIZE, myWorldPos.current.y + (dy / dist) * currentSpeed * dt));
       }
 
+      // Reconcile local Y with authoritative room state so remote knockback is visible on victim client.
+      const mySynced = smoothClients.current[idRef.current];
+      if (mySynced && typeof mySynced.y === 'number') {
+        const yDeltaFromServer = mySynced.y - myWorldPos.current.y;
+        if (Math.abs(yDeltaFromServer) > 40) {
+          myWorldPos.current.y = Math.max(0, Math.min(WORLD_SIZE, mySynced.y));
+        }
+      }
+
       const now = Date.now();
+      if (activeEmoteRef.current && activeEmoteUntilRef.current <= now) {
+        activeEmoteRef.current = null;
+        activeEmoteUntilRef.current = 0;
+      }
       if (now - lastUiRefresh.current > 250) {
         lastUiRefresh.current = now;
         setRenderTrigger((t) => t + 1);
@@ -292,37 +510,6 @@ function App() {
         if (t >= 1) {
           swingStart.current = 0;
           swingProgress.current = 0;
-        }
-      }
-
-      // 3. Gửi Firebase (networking) – tách tick mạng khỏi FPS và chỉ gửi khi state đổi đáng kể
-      if (now - lastSent.current > TICK_RATE) {
-        const angle = Math.atan2(mousePos.current.y, mousePos.current.x);
-        const payload = {
-          x: myWorldPos.current.x,
-          y: myWorldPos.current.y,
-          color: colorRef.current,
-          angle,
-          swordAngle: moveAngle.current,
-          swordSwing: swingProgress.current,
-          score: myScore.current,
-          boost: boostActive.current,
-          lastSeen: now,
-        };
-
-        const prev = lastSentState.current;
-        const dxNet = !prev ? Infinity : payload.x - prev.x;
-        const dyNet = !prev ? Infinity : payload.y - prev.y;
-        const movedFarEnough = !prev || Math.hypot(dxNet, dyNet) > 3; // chỉ gửi nếu dịch chuyển đủ xa
-        const swingChanged =
-          !prev ||
-          prev.swordSwing !== payload.swordSwing;
-        const boostChanged = !prev || prev.boost !== payload.boost;
-
-        if (movedFarEnough || swingChanged || boostChanged) {
-          lastSent.current = now;
-          lastSentState.current = payload;
-          dbSet(userRef, payload);
         }
       }
 
@@ -360,7 +547,7 @@ function App() {
 
       if (foodsToRemove.length > 0) {
         foodsToRemove.forEach((id) => {
-          const fRef = dbRef(db, `food/${id}`);
+          const fRef = dbRef(db, `${getRoomCollectionPath(roomId, 'food')}/${id}`);
           dbRemove(fRef);
         });
       }
@@ -447,13 +634,11 @@ function App() {
           if (bladeDistToEnemy < enemyRadius + mySword.impactRadius) {
             if (lastSwingHit.current[id] !== lastSwingTime.current) {
               lastSwingHit.current[id] = lastSwingTime.current;
-              p.y += KNOCKBACK_Y;
               const targetNow = smoothClients.current[id];
               if (targetNow) {
-                const victimRef = dbRef(db, `clients/${id}`);
-                dbSet(victimRef, {
-                  ...targetNow,
-                  y: Math.max(0, Math.min(WORLD_SIZE, targetNow.y + KNOCKBACK_Y)),
+                const nextY = Math.max(0, Math.min(WORLD_SIZE, targetNow.y + KNOCKBACK_Y));
+                dbSet(dbRef(db, `${clientsPath}/${id}/y`), nextY).catch((err) => {
+                  console.error('knockback write error', err);
                 });
               }
             }
@@ -472,6 +657,13 @@ function App() {
           Boolean(fbClient && fbClient.boost),
           enemyLevel,
         );
+
+        const enemyEmote = fbClient?.activeEmote && typeof fbClient?.emoteUntil === 'number' && fbClient.emoteUntil > now
+          ? getEmoteById(fbClient.activeEmote)
+          : null;
+        if (enemyEmote) {
+          drawEmoteBubble(ctx, ex, ey, enemyEmote.icon, enemyLevel, 1.6);
+        }
       });
 
             // Vẽ bản thân (size theo level)
@@ -500,6 +692,11 @@ function App() {
               attackCooldownProgress,
             );
 
+            const localEmote = activeEmoteRef.current ? getEmoteById(activeEmoteRef.current) : null;
+            if (localEmote && activeEmoteUntilRef.current > now) {
+              drawEmoteBubble(ctx, canvas.width / 2, canvas.height / 2, localEmote.icon, myLevel, 1.6);
+            }
+
       requestAnimationFrame(gameLoop);
     };
 
@@ -507,12 +704,15 @@ function App() {
     return () => {
       window.removeEventListener('resize', handleResize);
       window.removeEventListener('mousemove', handleMouseMove);
-      window.removeEventListener('mousedown', handleClick);
+      window.removeEventListener('mousedown', handleMouseDown);
+      window.removeEventListener('mouseup', handleMouseUp);
       window.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('keyup', handleKeyUp);
+      window.removeEventListener('contextmenu', handleContextMenu);
       cancelAnimationFrame(raf);
       dbRemove(userRef);
       clearInterval(hostPoll);
+      clearInterval(networkPoll);
     };
   }, []);
 
@@ -528,7 +728,8 @@ function App() {
     <div style={{ width: '100vw', height: '100vh', overflow: 'hidden', background: '#1a1a1a' }}>
       <canvas ref={canvasRef} style={{ display: 'block' }} />
       <GameHud hud={hudState} />
-      <RoomChatBox messages={chatMessages.current} />
+      <RoomChatBox messages={chatMessages} />
+      <EmoteWheel visible={isEmoteWheelOpen} center={emoteWheelCenter} hoveredIndex={emoteHoveredIndex} />
       {isChatInputOpen && (
         <ChatInputOverlay
           value={chatDraft}

@@ -1,129 +1,68 @@
-import { useEffect, useRef } from 'react';
-import { onChildAdded, onChildChanged, onChildRemoved, ref as dbRef } from 'firebase/database';
-import { db } from '../firebase/config';
-import { LERP_COMBAT_FACTOR, LERP_FACTOR } from '../constants/gameConfig';
-import { getRoomCollectionPath } from '../firebase/paths';
-import { lerp, normalizeAngle } from '../utils/math';
+/**
+ * Purpose:
+ * - Orchestrate realtime sync state used by the game scene.
+ *
+ * Responsibilities:
+ * - Keep separate raw (authoritative) and smooth (render) caches.
+ * - Wire networking, prediction, and interpolation modules together.
+ * - Run a fixed ~60 FPS smoothing tick independent from network cadence.
+ *
+ * Key concepts:
+ * - `rawClients/rawFoodItems`: last server snapshots; never rendered directly.
+ * - `smoothClients/foodItems`: render-facing state updated every 16ms.
+ * - Local player (`myId`) is never interpolated to avoid input latency.
+ */
+import { useEffect, useRef, useState } from 'react';
+import { useInterpolation } from './useInterpolation';
+import { useNetworkSync } from './useNetworkSync';
+import { usePrediction } from './usePrediction';
 
-const normalizeClientSnapshot = (data) => {
-  if (!data) return null;
-  const leftPunch = typeof data.leftPunch === 'number' ? data.leftPunch : 0;
-  const rightPunch = typeof data.rightPunch === 'number' ? data.rightPunch : 0;
-  const swordSwing =
-    typeof data.swordSwing === 'number'
-      ? data.swordSwing
-      : Math.max(leftPunch, rightPunch);
-
-  return {
-    ...data,
-    leftPunch,
-    rightPunch,
-    swordSwing,
-    swordAngle: typeof data.swordAngle === 'number' ? data.swordAngle : data.angle || 0,
-  };
-};
-
+/**
+ * Inputs:
+ * - roomId: active room namespace in Realtime Database.
+ * - myId: local player id used to bypass interpolation.
+ *
+ * Output:
+ * - `{ smoothClients, foodItems, chatMessages, rawClients, rawFoodItems }`.
+ *
+ * Critical rule:
+ * - Preserve raw/smooth separation; simulation code depends on raw snapshots.
+ */
 export const useGameSync = (roomId, myId) => {
   const smoothClients = useRef({});
   const foodItems = useRef({});
-  const chatMessages = useRef([]);
+  const [chatMessages, setChatMessages] = useState([]);
   const rawClients = useRef({});
   const rawFoodItems = useRef({});
   const rawChatItems = useRef({});
-  const rafRef = useRef(0);
+  const tickTimerRef = useRef(0);
+
+  const { applyPredictionToSnapshot, getPredictedTarget } = usePrediction(myId);
+  const { interpolateClientState } = useInterpolation();
+
+  useNetworkSync({
+    roomId,
+    myId,
+    smoothClients,
+    foodItems,
+    rawClients,
+    rawFoodItems,
+    rawChatItems,
+    setChatMessages,
+    applyPredictionToSnapshot,
+  });
 
   useEffect(() => {
-    const clientsPath = getRoomCollectionPath(roomId, 'clients');
-    const foodPath = getRoomCollectionPath(roomId, 'food');
-    const chatPath = getRoomCollectionPath(roomId, 'chat');
-    const clientsRef = dbRef(db, clientsPath);
-    const foodRef = dbRef(db, foodPath);
-    const chatRef = dbRef(db, chatPath);
-
-    const refreshChatMessages = () => {
-      const sorted = Object.entries(rawChatItems.current)
-        .map(([id, msg]) => ({ id, ...msg }))
-        .filter((msg) => typeof msg.text === 'string' && msg.text.trim().length > 0)
-        .sort((a, b) => (a.ts || 0) - (b.ts || 0));
-      chatMessages.current = sorted.slice(-20);
-    };
-
-    const upsertClient = (id, data) => {
-      if (!data) return;
-      const normalized = normalizeClientSnapshot(data);
-      rawClients.current[id] = normalized;
-      if (id === myId || !smoothClients.current[id]) {
-        smoothClients.current[id] = { ...normalized };
-      }
-    };
-
-    const removeClient = (id) => {
-      delete rawClients.current[id];
-      delete smoothClients.current[id];
-    };
-
-    const upsertFood = (id, data) => {
-      if (!data) return;
-      rawFoodItems.current[id] = data;
-      foodItems.current[id] = data;
-    };
-
-    const removeFood = (id) => {
-      delete rawFoodItems.current[id];
-      delete foodItems.current[id];
-    };
-
-    const upsertChat = (id, data) => {
-      if (!data) return;
-      rawChatItems.current[id] = data;
-      refreshChatMessages();
-    };
-
-    const removeChat = (id) => {
-      delete rawChatItems.current[id];
-      refreshChatMessages();
-    };
-
-    const unsubscribeClientAdded = onChildAdded(clientsRef, (snap) => {
-      upsertClient(snap.key, snap.val());
-    });
-
-    const unsubscribeClientChanged = onChildChanged(clientsRef, (snap) => {
-      upsertClient(snap.key, snap.val());
-    });
-
-    const unsubscribeClientRemoved = onChildRemoved(clientsRef, (snap) => {
-      removeClient(snap.key);
-    });
-
-    const unsubscribeFoodAdded = onChildAdded(foodRef, (snap) => {
-      upsertFood(snap.key, snap.val());
-    });
-
-    const unsubscribeFoodChanged = onChildChanged(foodRef, (snap) => {
-      upsertFood(snap.key, snap.val());
-    });
-
-    const unsubscribeFoodRemoved = onChildRemoved(foodRef, (snap) => {
-      removeFood(snap.key);
-    });
-
-    const unsubscribeChatAdded = onChildAdded(chatRef, (snap) => {
-      upsertChat(snap.key, snap.val());
-    });
-
-    const unsubscribeChatChanged = onChildChanged(chatRef, (snap) => {
-      upsertChat(snap.key, snap.val());
-    });
-
-    const unsubscribeChatRemoved = onChildRemoved(chatRef, (snap) => {
-      removeChat(snap.key);
-    });
-
+    /**
+     * Per-frame smoothing step.
+     * WHY: network updates are bursty; render tick must stay visually stable.
+     */
     const tick = () => {
+      const now = Date.now();
       Object.entries(rawClients.current).forEach(([id, target]) => {
         if (!target) return;
 
+        // Local player state is already immediate on this client.
         if (id === myId) {
           smoothClients.current[id] = { ...target };
           return;
@@ -134,60 +73,23 @@ export const useGameSync = (roomId, myId) => {
           smoothClients.current[id] = { ...target };
           return;
         }
-
-        current.x = lerp(current.x ?? target.x, target.x, LERP_FACTOR);
-        current.y = lerp(current.y ?? target.y, target.y, LERP_FACTOR);
-        current.angle = (current.angle ?? target.angle ?? 0) +
-          normalizeAngle((target.angle ?? 0) - (current.angle ?? target.angle ?? 0)) * LERP_FACTOR;
-
-        const targetSwordAngle = typeof target.swordAngle === 'number' ? target.swordAngle : (target.angle || 0);
-        current.swordAngle = (current.swordAngle ?? targetSwordAngle) +
-          normalizeAngle(targetSwordAngle - (current.swordAngle ?? targetSwordAngle)) * LERP_FACTOR;
-
-        current.leftPunch = lerp(current.leftPunch ?? 0, typeof target.leftPunch === 'number' ? target.leftPunch : 0, LERP_COMBAT_FACTOR);
-        current.rightPunch = lerp(current.rightPunch ?? 0, typeof target.rightPunch === 'number' ? target.rightPunch : 0, LERP_COMBAT_FACTOR);
-        current.swordSwing = lerp(
-          current.swordSwing ?? 0,
-          typeof target.swordSwing === 'number' ? target.swordSwing : Math.max(target.leftPunch || 0, target.rightPunch || 0),
-          LERP_COMBAT_FACTOR,
-        );
-
-        // Keep authoritative combat timing fields in sync (host bot logic depends on these).
-        current.punchHand = target.punchHand;
-        current.punchStart = target.punchStart;
-        current.nextPunchHand = target.nextPunchHand;
-        current.lastPunchTime = target.lastPunchTime;
-        current.lastPunchHit = target.lastPunchHit;
-        current.color = target.color;
-        current.score = target.score;
-        current.boost = target.boost;
-        current.name = target.name;
-        current.lastSeen = target.lastSeen;
+        const displayTarget = getPredictedTarget(id, target, now);
+        interpolateClientState(id, current, target, displayTarget);
       });
 
       Object.entries(rawFoodItems.current).forEach(([id, target]) => {
         if (!target) return;
         foodItems.current[id] = target;
       });
-
-      rafRef.current = requestAnimationFrame(tick);
     };
 
-    rafRef.current = requestAnimationFrame(tick);
+    // Performance-sensitive loop: keep this fixed and lightweight.
+    tickTimerRef.current = window.setInterval(tick, 16);
 
     return () => {
-      unsubscribeClientAdded();
-      unsubscribeClientChanged();
-      unsubscribeClientRemoved();
-      unsubscribeFoodAdded();
-      unsubscribeFoodChanged();
-      unsubscribeFoodRemoved();
-      unsubscribeChatAdded();
-      unsubscribeChatChanged();
-      unsubscribeChatRemoved();
-      cancelAnimationFrame(rafRef.current);
+      window.clearInterval(tickTimerRef.current);
     };
-  }, [roomId, myId]);
+  }, [roomId, myId, getPredictedTarget, interpolateClientState]);
 
-  return { smoothClients, foodItems, chatMessages };
+  return { smoothClients, foodItems, chatMessages, rawClients, rawFoodItems };
 };

@@ -1,8 +1,21 @@
+/**
+ * Purpose:
+ * - Maintain target food population per room.
+ *
+ * Responsibilities:
+ * - Generate food payloads with randomized position/size/color.
+ * - Keep total count at `TARGET_FOOD_COUNT`.
+ *
+ * Key concepts:
+ * - Spawn writes are room-scoped.
+ * - Existing food must be preserved when adding new items.
+ */
 import { ref as dbRef, set as dbSet, get } from 'firebase/database';
 import { db } from '../firebase/config';
 import { TARGET_FOOD_COUNT, WORLD_SIZE } from '../constants/gameConfig';
+import { getRoomCollectionPath } from '../firebase/paths';
 
-// Tạo màu ngẫu nhiên dạng HSL cho dễ nhìn
+/** Output: random HSL color string for food marker variety. */
 const randomColor = () => {
 	const h = Math.floor(Math.random() * 360);
 	const s = 70 + Math.random() * 20; // 70–90%
@@ -10,7 +23,7 @@ const randomColor = () => {
 	return `hsl(${h}, ${s}%, ${l}%)`;
 };
 
-// Random size: 1, 2 hoặc 3
+/** Output: weighted random food size (1, 2, or 3). */
 const randomSize = () => {
 	const r = Math.random();
 	if (r < 0.5) return 1;   // nhiều food nhỏ
@@ -18,8 +31,10 @@ const randomSize = () => {
 	return 3;                // ít food lớn
 };
 
-// Lấy toạ độ random nhưng cố gắng phân bổ đều
-// Ý tưởng: chia map thành lưới, mỗi ô random một điểm
+/**
+ * Inputs: grid cell coordinates + cell size.
+ * Output: random world-space position clamped inside map bounds.
+ */
 const randomPositionInCell = (cellX, cellY, cellSize) => {
 	const x = cellX * cellSize + Math.random() * cellSize;
 	const y = cellY * cellSize + Math.random() * cellSize;
@@ -29,10 +44,15 @@ const randomPositionInCell = (cellX, cellY, cellSize) => {
 	};
 };
 
-// Spawn thêm food để luôn có đúng TARGET_FOOD_COUNT food trên map
-// Lưu vào Firebase node: /food/{foodId}
-export const spawnFood = async () => {
-	const foodRef = dbRef(db, 'food');
+/**
+ * Input: roomId.
+ * Output: none (side effect writes missing food entries).
+ *
+ * Critical rule:
+ * - Preserve existing food entries when appending new ones.
+ */
+export const spawnFood = async (roomId) => {
+	const foodRef = dbRef(db, getRoomCollectionPath(roomId, 'food'));
 
 	// Đọc danh sách food hiện tại
 	const snap = await get(foodRef);

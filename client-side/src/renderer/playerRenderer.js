@@ -1,3 +1,14 @@
+/**
+ * Purpose:
+ * - Render player entities and player-adjacent overlays.
+ *
+ * Responsibilities:
+ * - Draw body, sword, eyes, boost ring, and label for each character.
+ * - Draw attack cooldown and emote bubble overlays.
+ *
+ * Key concepts:
+ * - Render math is derived from gameplay constants; visuals must stay in sync with hit logic.
+ */
 import {
   PLAYER_SIZE,
   SWORD_BASE_ANGLE,
@@ -5,6 +16,16 @@ import {
 } from '../constants/gameConfig';
 import { getSizeFromLevel } from '../utils/physics';
 
+/**
+ * Inputs:
+ * - Canvas context + world-space render info (position, angle, animation state, label).
+ *
+ * Output:
+ * - None; draws a full player representation to `ctx`.
+ *
+ * Critical rule:
+ * - Sword sweep math should stay aligned with combat geometry helpers.
+ */
 export const drawPlayer = (
   ctx,
   x,
@@ -197,6 +218,13 @@ export const drawPlayer = (
   ctx.restore();
 };
 
+/**
+ * Inputs:
+ * - Canvas context, player anchor, level, and normalized cooldown progress.
+ *
+ * Output:
+ * - None; draws cooldown bar only when progress > 0.
+ */
 export const drawAttackCooldownUnderLabel = (ctx, x, y, level, cooldownProgress) => {
   const bodySize = typeof level === 'number' ? getSizeFromLevel(level) : PLAYER_SIZE;
   const clamped = Math.max(0, Math.min(1, Number(cooldownProgress) || 0));
@@ -222,5 +250,46 @@ export const drawAttackCooldownUnderLabel = (ctx, x, y, level, cooldownProgress)
   ctx.roundRect(barX, barY, barWidth * clamped, barHeight, 999);
   ctx.fill();
 
+  ctx.restore();
+};
+
+/**
+ * Inputs:
+ * - Canvas context, player anchor, emote string, level, and optional scale.
+ *
+ * Output:
+ * - None; draws speech-bubble style emote indicator.
+ */
+export const drawEmoteBubble = (ctx, x, y, emoteText, level, scale = 1) => {
+  if (!emoteText) return;
+
+  const bodySize = typeof level === 'number' ? getSizeFromLevel(level) : PLAYER_SIZE;
+  const bubbleText = String(emoteText);
+  const bubbleScale = Math.max(1, Number(scale) || 1);
+  const bubbleY = y - bodySize / 2 - 30;
+  const fontSize = bubbleText === 'GG' ? 18 : 20;
+  const renderFontSize = Math.round(fontSize * bubbleScale);
+
+  ctx.save();
+  ctx.font = `bold ${renderFontSize}px Arial`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  const textWidth = ctx.measureText(bubbleText).width;
+  const bubbleWidth = Math.max(30, Math.round((textWidth + 10) * bubbleScale));
+  const bubbleHeight = Math.round(28 * bubbleScale);
+
+  ctx.shadowBlur = 6;
+  ctx.shadowColor = 'rgba(0,0,0,0.5)';
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.68)';
+  ctx.strokeStyle = 'rgba(255,255,255,0.85)';
+  ctx.lineWidth = Math.max(2, bubbleScale * 2);
+  ctx.beginPath();
+  ctx.roundRect(x - bubbleWidth / 2, bubbleY - bubbleHeight / 2, bubbleWidth, bubbleHeight, 12);
+  ctx.fill();
+  ctx.stroke();
+
+  ctx.shadowBlur = 0;
+  ctx.fillStyle = '#ffffff';
+  ctx.fillText(bubbleText, x, bubbleY + 1);
   ctx.restore();
 };

@@ -1,6 +1,20 @@
+/**
+ * Purpose:
+ * - Render gameplay HUD panels (XP progress + leaderboard).
+ *
+ * Responsibilities:
+ * - Display player progression and compact ranking context.
+ *
+ * Key concepts:
+ * - Component is display-only; upstream `buildHudState` owns calculations.
+ */
 import React from 'react';
 import { getLevelFromScore } from '../utils/physics';
 
+/**
+ * Input: `hud` object produced by `buildHudState`.
+ * Output: HUD JSX overlay.
+ */
 function GameHud({ hud }) {
   return (
     <>

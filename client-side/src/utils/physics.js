@@ -1,3 +1,15 @@
+/**
+ * Purpose:
+ * - Gameplay geometry and level-size progression helpers.
+ *
+ * Responsibilities:
+ * - Map score to level/size.
+ * - Build sword world-space segment for hit checks.
+ * - Evaluate basic collision predicates.
+ *
+ * Key concepts:
+ * - Shared by both renderer and simulation, so formulas must stay consistent.
+ */
 import {
   PLAYER_SIZE,
   EVOWARS_XP_TABLE,
@@ -8,6 +20,7 @@ import {
   SWORD_SWEEP_ARC,
 } from '../constants/gameConfig';
 
+/** Input: score value. Output: clamped level in [1, MAX_LEVEL]. */
 export const getLevelFromScore = (score) => {
   if (!Number.isFinite(score) || score <= 0) return 1;
   let level = 1;
@@ -23,11 +36,22 @@ export const getLevelFromScore = (score) => {
   return level;
 };
 
+/** Input: level value. Output: world body size for that level. */
 export const getSizeFromLevel = (level) => {
   const safeLevel = Math.max(1, Number.isFinite(level) ? level : 1);
   return PLAYER_SIZE + (safeLevel - 1) * 4;
 };
 
+/**
+ * Inputs:
+ * - Player transform, body size, swing progress, and hand side.
+ *
+ * Output:
+ * - Sword hand/tip world points + effective impact radius.
+ *
+ * Critical rule:
+ * - Keep this aligned with renderer sweep visuals and hit detection.
+ */
 export const getSwordWorldPoints = (x, y, angle, size, progress, side = 'left') => {
   const clampedProgress = Math.max(0, Math.min(1, progress || 0));
   const dir = side === 'right' ? -1 : 1;
@@ -52,6 +76,7 @@ export const getSwordWorldPoints = (x, y, angle, size, progress, side = 'left') 
   };
 };
 
+/** Input: two entities with x/y and threshold distance. Output: boolean overlap result. */
 export const checkCollision = (obj1, obj2, dist) => {
   if (!obj1 || !obj2 || typeof dist !== 'number') return false;
   if (
@@ -65,6 +90,10 @@ export const checkCollision = (obj1, obj2, dist) => {
   return Math.hypot(obj1.x - obj2.x, obj1.y - obj2.y) < dist;
 };
 
+/**
+ * Input: entity that may define size directly or via score.
+ * Output: resolved body size used by hit checks.
+ */
 const resolveEntitySize = (entity) => {
   if (!entity) return PLAYER_SIZE;
   if (typeof entity.size === 'number') return entity.size;
@@ -75,6 +104,13 @@ const resolveEntitySize = (entity) => {
   return PLAYER_SIZE;
 };
 
+/**
+ * Inputs:
+ * - Attacker/target entities and left/right punch progress values.
+ *
+ * Output:
+ * - Whether either active hand intersects target body.
+ */
 export const isPunchHit = (attacker, target, leftP, rightP) => {
   if (!attacker || !target) return false;
   if (

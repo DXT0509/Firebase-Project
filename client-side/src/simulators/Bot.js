@@ -1,5 +1,20 @@
+/**
+ * Purpose:
+ * - Host-side bot simulation: spawn, movement, combat, and persistence.
+ *
+ * Responsibilities:
+ * - Keep target bot count stable in a room.
+ * - Simulate bot steering toward food and combat impact resolution.
+ * - Write bot/hit/food updates back to Firebase safely.
+ *
+ * Key concepts:
+ * - Host-authoritative update model.
+ * - Simulation runs on raw snapshots (not smoothed render state).
+ * - All writes are room-scoped; root-path writes will desync rooms.
+ */
 import { ref as dbRef, get, set as dbSet, remove as dbRemove } from 'firebase/database';
 import { db } from '../firebase/config';
+import { getRoomCollectionPath } from '../firebase/paths';
 import {
 	WORLD_SIZE,
 	PUNCH_DURATION,
@@ -13,17 +28,21 @@ import {
 import { getLevelFromScore, getSizeFromLevel, getSwordWorldPoints } from '../utils/physics';
 import { getPointToSegmentDistance } from '../utils/math';
 
-// Lưu timestamp mô phỏng lần trước để tính bước di chuyển theo thời gian thực
+// Performance-sensitive: persisted between ticks to keep speed frame-rate independent.
 let lastBotSimTs = 0;
 
 
+/**
+ * Input: bot score.
+ * Output: attack cooldown in ms.
+ */
 const getBotAttackDelayMs = (score) => {
 	const level = getLevelFromScore(score);
 	return PUNCH_COOLDOWN + PUNCH_COOLDOWN_PER_LEVEL * (level - 1);
 };
 
 
-// Tạo màu ngẫu nhiên dạng HSL cho bot
+/** Output: random HSL bot color string. */
 const randomColor = () => {
 	const h = Math.floor(Math.random() * 360);
 	const s = 70 + Math.random() * 20; // 70–90%
@@ -31,10 +50,17 @@ const randomColor = () => {
 	return `hsl(${h}, ${s}%, ${l}%)`;
 };
 
-// Tạo ID bot ổn định (để nhiều lần gọi không spam thêm)
+/** Input: numeric bot index. Output: stable bot id string. */
 const makeBotId = (index) => `${BOT_ID_PREFIX}${index.toString().padStart(3, '0')}`;
 
-// Chia map thành lưới và đếm số player (kể cả bot) trong từng ô
+/**
+ * Inputs:
+ * - clients: client map.
+ * - gridSize: number of cells per axis.
+ *
+ * Output:
+ * - `{ grid, cellSize }` occupancy information for sparse spawning.
+ */
 const buildOccupancyGrid = (clients, gridSize) => {
 	const cellSize = WORLD_SIZE / gridSize;
 	const grid = Array.from({ length: gridSize }, () =>
@@ -53,7 +79,13 @@ const buildOccupancyGrid = (clients, gridSize) => {
 	return { grid, cellSize };
 };
 
-// Tìm một vị trí trong ô ít người nhất hiện tại
+/**
+ * Inputs:
+ * - grid and cellSize from occupancy map.
+ *
+ * Output:
+ * - Spawn position in the least crowded region.
+ */
 const pickPositionInLeastCrowdedCell = (grid, cellSize) => {
 	let minCount = Infinity;
 	const candidates = [];
@@ -90,7 +122,7 @@ const pickPositionInLeastCrowdedCell = (grid, cellSize) => {
 	};
 };
 
-// Tạo dữ liệu một bot mới tại (x, y)
+/** Inputs: spawn x/y. Output: initialized bot payload for Firebase. */
 const createBotPayload = (x, y) => {
 	return {
 		x,
@@ -112,6 +144,13 @@ const createBotPayload = (x, y) => {
 	};
 };
 
+/**
+ * Inputs:
+ * - bot state and current timestamp.
+ *
+ * Output:
+ * - Derived punch/swing state for this tick.
+ */
 const getBotPunchState = (bot, now) => {
 	let punchHand = typeof bot.punchHand === 'number' ? bot.punchHand : 0;
 	let punchStart = typeof bot.punchStart === 'number' ? bot.punchStart : 0;
@@ -149,6 +188,10 @@ const getBotPunchState = (bot, now) => {
 	};
 };
 
+/**
+ * Inputs: base bot state, facing angle, punch state.
+ * Output: bot state with synchronized combat pose fields.
+ */
 const withBotCombatPose = (bot, angle, punchState) => {
 	return {
 		...bot,
@@ -160,8 +203,48 @@ const withBotCombatPose = (bot, angle, punchState) => {
 	};
 };
 
+/** Input: coordinate value. Output: value clamped to world bounds. */
 const clampWorld = (value) => Math.max(0, Math.min(WORLD_SIZE, value));
 
+/**
+ * Input: bot payload.
+ * Output: Firebase-safe payload with undefined fields removed.
+ *
+ * Critical rule:
+ * - Never write undefined to RTDB; it will throw and stop bot updates.
+ */
+const sanitizeBotForDb = (bot) => {
+	const output = {};
+	Object.entries(bot || {}).forEach(([key, value]) => {
+		if (value === undefined) return;
+
+		if (key === 'lastPunchHit') {
+			if (!value || typeof value !== 'object') return;
+			const cleanedMemo = {};
+			Object.entries(value).forEach(([targetId, stamp]) => {
+				if (typeof stamp === 'number' && Number.isFinite(stamp)) {
+					cleanedMemo[targetId] = stamp;
+				}
+			});
+			if (Object.keys(cleanedMemo).length > 0) {
+				output.lastPunchHit = cleanedMemo;
+			}
+			return;
+		}
+
+		output[key] = value;
+	});
+
+	return output;
+};
+
+/**
+ * Inputs:
+ * - attacker and target entities.
+ *
+ * Output:
+ * - Whether target body intersects attacker sword segment this tick.
+ */
 const isSwordSegmentHit = (attacker, target) => {
 	if (!attacker || !target) return false;
 	if (
@@ -195,9 +278,16 @@ const isSwordSegmentHit = (attacker, target) => {
 	return distanceToBlade <= targetBodyRadius + sword.impactRadius;
 };
 
-// Hàm chính: đảm bảo map có đúng 100 bot
-export const ensureBots = async () => {
-	const clientsRef = dbRef(db, 'clients');
+/**
+ * Input: roomId.
+ * Output: none (side effect writes missing bots to Firebase).
+ *
+ * WHY:
+ * - Keep bot population stable without overwriting full clients node.
+ */
+export const ensureBots = async (roomId) => {
+	const clientsPath = getRoomCollectionPath(roomId, 'clients');
+	const clientsRef = dbRef(db, clientsPath);
 	const snap = await get(clientsRef);
 	const allClients = snap.val() || {};
 
@@ -232,12 +322,12 @@ export const ensureBots = async () => {
 	// Ghi từng bot mới theo per-entity path để giảm kích thước mỗi lần ghi
 	await Promise.all(
 		Object.entries(updates).map(([id, payload]) =>
-			dbSet(dbRef(db, `clients/${id}`), payload),
+			dbSet(dbRef(db, `${clientsPath}/${id}`), payload),
 		),
 	);
 };
 
-// Tìm food gần nhất với một bot, trả về cả id và data
+/** Input: bot + food map. Output: nearest `{ id, food }` or null. */
 const findNearestFood = (bot, foods) => {
 	let nearest = null;
 	let nearestId = null;
@@ -259,11 +349,23 @@ const findNearestFood = (bot, foods) => {
 	return { id: nearestId, food: nearest };
 };
 
-// Cập nhật vị trí bot: mỗi bot sẽ di chuyển một bước về phía food gần nhất
-// Cho phép truyền vào snapshot sẵn có để tránh get() liên tục (host có thể dùng cache local).
-export const updateBotsTowardFood = async (allClientsOverride, allFoodOverride) => {
-	const clientsRef = dbRef(db, 'clients');
-	const foodRef = dbRef(db, 'food');
+/**
+ * Inputs:
+ * - Optional `allClientsOverride` and `allFoodOverride` snapshots.
+ * - roomId used for room-scoped writes.
+ *
+ * Output:
+ * - None (side effects update bot state and consume eaten food).
+ *
+ * Critical rules:
+ * - Do not feed smoothed client data here; simulation requires authoritative snapshots.
+ * - Keep batched writes per entity to avoid large full-node overwrites.
+ */
+export const updateBotsTowardFood = async (allClientsOverride, allFoodOverride, roomId) => {
+	const clientsPath = getRoomCollectionPath(roomId, 'clients');
+	const foodPath = getRoomCollectionPath(roomId, 'food');
+	const clientsRef = dbRef(db, clientsPath);
+	const foodRef = dbRef(db, foodPath);
 
 	let allClients;
 	let allFood;
@@ -285,7 +387,10 @@ export const updateBotsTowardFood = async (allClientsOverride, allFoodOverride) 
 	const botEntries = Object.entries(allClients).filter(([id]) => id.startsWith(BOT_ID_PREFIX));
 	const botClients = Object.fromEntries(botEntries);
 
-	if (!botEntries.length) return;
+	if (!botEntries.length) {
+		lastBotSimTs = 0;
+		return;
+	}
 
 	const now = Date.now();
 	if (!lastBotSimTs) lastBotSimTs = now;
@@ -430,16 +535,16 @@ export const updateBotsTowardFood = async (allClientsOverride, allFoodOverride) 
 			return;
 		}
 
-		humanYWrites.push(dbSet(dbRef(db, `clients/${targetId}/y`), nextY));
+		humanYWrites.push(dbSet(dbRef(db, `${clientsPath}/${targetId}/y`), nextY));
 	});
 
 	// Per-entity cập nhật cho bot + xoá food bị ăn, tránh overwrite toàn bộ node
 	const botWrites = Object.entries(updatedBots).map(([id, bot]) =>
-		dbSet(dbRef(db, `clients/${id}`), bot),
+		dbSet(dbRef(db, `${clientsPath}/${id}`), sanitizeBotForDb(bot)),
 	);
 
 	const foodDeletes = foodsToRemove.map((foodId) =>
-		foodId ? dbRemove(dbRef(db, `food/${foodId}`)) : Promise.resolve(),
+		foodId ? dbRemove(dbRef(db, `${foodPath}/${foodId}`)) : Promise.resolve(),
 	);
 
 	await Promise.all([...botWrites, ...humanYWrites, ...foodDeletes]);

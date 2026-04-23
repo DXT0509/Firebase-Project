@@ -1,8 +1,21 @@
+/**
+ * Purpose:
+ * - Render room chat history panel.
+ *
+ * Responsibilities:
+ * - Display recent messages with sender and timestamp.
+ * - Auto-scroll to newest messages on update.
+ *
+ * Key concepts:
+ * - Panel is read-only (`pointerEvents: none`) while gameplay remains interactive.
+ */
 import React, { useEffect, useRef } from 'react';
 
+/** Input: `messages` array. Output: chat panel JSX. */
 function RoomChatBox({ messages }) {
   const listRef = useRef(null);
 
+  /** Input: unix ms timestamp. Output: HH:MM display string. */
   const formatTime = (ts) => {
     if (!Number.isFinite(ts)) return '--:--';
     const d = new Date(ts);
@@ -12,6 +25,7 @@ function RoomChatBox({ messages }) {
     return `${hh}:${mm}`;
   };
 
+  // Keep latest incoming chat visible without user scrolling interactions.
   useEffect(() => {
     if (!listRef.current) return;
     listRef.current.scrollTop = listRef.current.scrollHeight;

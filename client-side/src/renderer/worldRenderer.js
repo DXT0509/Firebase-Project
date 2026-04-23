@@ -1,6 +1,25 @@
+/**
+ * Purpose:
+ * - Render world-level visuals (map grid and food entities).
+ *
+ * Responsibilities:
+ * - Draw static background grid using camera offsets.
+ * - Draw food and report consumable collisions with local player.
+ *
+ * Key concepts:
+ * - Rendering applies camera transform externally via `camX/camY`.
+ * - Food consumption is computed during render pass for local player only.
+ */
 import { FOOD_BASE_RADIUS, GRID_STEP, VIEW_MARGIN, WORLD_SIZE } from '../constants/gameConfig';
 import { getDistance } from '../utils/math';
 
+/**
+ * Inputs:
+ * - Canvas context, camera offset, and viewport size.
+ *
+ * Output:
+ * - None; paints world bounds and grid lines.
+ */
 export const drawGrid = (ctx, camX, camY, width, height) => {
   ctx.fillStyle = '#a8ffa8';
   ctx.fillRect(camX, camY, WORLD_SIZE, WORLD_SIZE);
@@ -20,6 +39,17 @@ export const drawGrid = (ctx, camX, camY, width, height) => {
   }
 };
 
+/**
+ * Inputs:
+ * - Canvas context, food collection, camera offset, and local player collision info.
+ * - Optional `onEat` callback invoked when local player consumes food.
+ *
+ * Output:
+ * - Array of eaten food IDs to remove from backend.
+ *
+ * Performance-sensitive:
+ * - Early culling by viewport margin prevents unnecessary draw calls.
+ */
 export const drawFood = (ctx, foodItems, camX, camY, myWorldPos, myRadius, onEat) => {
   const foodsToRemove = [];
 

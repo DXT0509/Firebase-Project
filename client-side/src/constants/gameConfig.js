@@ -1,3 +1,15 @@
+/**
+ * Purpose:
+ * - Central gameplay tuning constants.
+ *
+ * Responsibilities:
+ * - Define shared world/combat/simulation parameters.
+ * - Provide XP table and derived cooldown helper.
+ *
+ * Key concepts:
+ * - Values here are consumed by simulation, sync, and renderer together.
+ * - Keep cross-module constants coherent to avoid visual/logic drift.
+ */
 export const WORLD_SIZE = 5000;
 export const TICK_RATE = 120; // ms
 export const LERP_FACTOR = 0.3;
@@ -86,6 +98,10 @@ export const GRID_STEP = 75;
 export const FOOD_BASE_RADIUS = 4;
 export const VIEW_MARGIN = 100;
 
+/**
+ * Input: player level.
+ * Output: attack cooldown in milliseconds.
+ */
 export const getAttackDelayByLevel = (level) => {
   const safeLevel = Math.max(1, Number.isFinite(level) ? level : 1);
   return PUNCH_COOLDOWN + PUNCH_COOLDOWN_PER_LEVEL * (safeLevel - 1);

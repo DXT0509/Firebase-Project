@@ -1,3 +1,13 @@
+/**
+ * Purpose:
+ * - Build a presentation-ready HUD snapshot from realtime client state.
+ *
+ * Responsibilities:
+ * - Compute rank rows, level progression, and attack cooldown display data.
+ *
+ * Key concepts:
+ * - This function is pure and deterministic for easier UI updates.
+ */
 import {
   EVOWARS_XP_TABLE,
   MAX_LEVEL,
@@ -5,6 +15,17 @@ import {
 } from '../constants/gameConfig';
 import { getLevelFromScore } from './physics';
 
+/**
+ * Inputs:
+ * - `clients`: synchronized render client map.
+ * - `myId`: local player id.
+ * - `fallbackScore`: local score fallback while sync catches up.
+ * - `lastSwingTime`: timestamp of latest attack.
+ * - `now`: current timestamp (default `Date.now()`).
+ *
+ * Output:
+ * - HUD object consumed by `GameHud`.
+ */
 export const buildHudState = (
   clients,
   myId,
@@ -46,6 +67,7 @@ export const buildHudState = (
   const attackCooldownRemaining = Math.max(0, attackCooldownMs - (now - lastSwingTime));
   const attackCooldownProgress = attackCooldownMs > 0 ? attackCooldownRemaining / attackCooldownMs : 0;
 
+  // Keep leaderboard compact while preserving local player context.
   let leaderboardRows = [];
   if (sortedByScore.length <= 5) {
     leaderboardRows = sortedByScore;
