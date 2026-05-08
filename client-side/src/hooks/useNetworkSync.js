@@ -44,7 +44,26 @@ const normalizeClientSnapshot = (data) => {
     activeEmote: typeof data.activeEmote === 'string' && data.activeEmote.length > 0 ? data.activeEmote : null,
     emoteUntil: typeof data.emoteUntil === 'number' ? data.emoteUntil : 0,
     emoteAt: typeof data.emoteAt === 'number' ? data.emoteAt : 0,
+    // Server-driven death/respawn state. Never derive these client-side.
+    isDead: data.isDead === true,
+    killerId: typeof data.killerId === 'string' && data.killerId.length > 0 ? data.killerId : null,
+    invulnerableUntil: typeof data.invulnerableUntil === 'number' ? data.invulnerableUntil : 0,
+    updatedAt: typeof data.updatedAt === 'number' ? data.updatedAt : 0,
   };
+};
+
+/**
+ * Inputs:
+ * - current: existing cached client state.
+ * - incoming: latest normalized snapshot.
+ *
+ * Output:
+ * - Whether incoming state is newer or equally fresh.
+ */
+const shouldAcceptClientSnapshot = (current, incoming) => {
+  const currentUpdatedAt = typeof current?.updatedAt === 'number' ? current.updatedAt : 0;
+  const incomingUpdatedAt = typeof incoming?.updatedAt === 'number' ? incoming.updatedAt : 0;
+  return incomingUpdatedAt >= currentUpdatedAt;
 };
 
 /**
@@ -104,14 +123,26 @@ export const useNetworkSync = ({
       const previous = rawClients.current[id];
       const predictedSnapshot = applyPredictionToSnapshot(id, normalized, previous);
 
+      const rawCurrent = rawClients.current[id];
+      if (rawCurrent && !shouldAcceptClientSnapshot(rawCurrent, predictedSnapshot)) {
+        return;
+      }
+
       rawClients.current[id] = predictedSnapshot;
 
       // Emote fields are copied immediately so overlays stay responsive.
       const existing = smoothClients.current[id];
       if (existing && id !== myId) {
+        if (!shouldAcceptClientSnapshot(existing, predictedSnapshot)) {
+          return;
+        }
         existing.activeEmote = predictedSnapshot.activeEmote;
         existing.emoteUntil = predictedSnapshot.emoteUntil;
         existing.emoteAt = predictedSnapshot.emoteAt;
+        existing.isDead = predictedSnapshot.isDead;
+        existing.killerId = predictedSnapshot.killerId;
+        existing.invulnerableUntil = predictedSnapshot.invulnerableUntil;
+        existing.updatedAt = predictedSnapshot.updatedAt;
       }
 
       if (id === myId || !smoothClients.current[id]) {

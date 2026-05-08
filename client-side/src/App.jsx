@@ -39,13 +39,17 @@ import {
   SWING_RETURN_DURATION,
   SWING_TOTAL_DURATION,
   KNOCKBACK_Y,
+  RESPAWN_DELAY_MS,
+  RESPAWN_INVULNERABLE_MS,
   BOT_UPDATE_INTERVAL_MS,
   BOT_ENSURE_INTERVAL_MS,
   FOOD_SPAWN_INTERVAL_MS,
   DEFAULT_ROOM_ID,
+  BOT_ID_PREFIX,
 } from './constants/gameConfig';
 import {
   getLevelFromScore,
+  getScoreFloorForLevel,
   getSizeFromLevel,
   getSwordWorldPoints,
   checkCollision,
@@ -55,9 +59,11 @@ import { drawPlayer, drawAttackCooldownUnderLabel } from './renderer/playerRende
 import { drawGrid, drawFood } from './renderer/worldRenderer';
 import { useGameSync } from './hooks/useGameSync';
 import { buildHudState } from './utils/hudState';
+import { buildCombatHitPatches } from './utils/combat';
 import GameHud from './components/GameHud';
 import RoomChatBox from './components/RoomChatBox';
 import ChatInputOverlay from './components/ChatInputOverlay';
+import DeathOverlay from './components/DeathOverlay';
 import { getRoomCollectionPath } from './firebase/paths';
 import EmoteWheel from './components/EmoteWheel';
 import { EMOTE_OPTIONS, EMOTE_DURATION_MS, getEmoteById } from './constants/emotes';
@@ -95,6 +101,7 @@ function App() {
   const lastFoodSpawn = useRef(0);
   const lastSentState = useRef(null);
   const myScore = useRef(0);
+  const wasDeadLastSync = useRef(false);
   const shiftPressed = useRef(false);
   const boostActive = useRef(false);
   const boostScoreAccumulator = useRef(0);
@@ -211,6 +218,9 @@ function App() {
       if (emoteWheelOpenRef.current) return;
 
       const now = Date.now();
+      const mySyncState = rawClients.current[idRef.current] || smoothClients.current[idRef.current];
+      if (mySyncState?.isDead === true) return;
+      if (typeof mySyncState?.invulnerableUntil === 'number' && mySyncState.invulnerableUntil > now) return;
       const myLevelNow = getLevelFromScore(myScore.current);
       const swingCooldownNow = getAttackDelayByLevel(myLevelNow);
       if ((swingStart.current && now - swingStart.current < SWING_TOTAL_DURATION) || (now - lastSwingTime.current < swingCooldownNow)) return;
@@ -367,17 +377,40 @@ function App() {
     // Performance-sensitive sender loop: keep network updates independent from render throttling.
     const networkPoll = setInterval(() => {
       const now = Date.now();
+      const mySyncState = rawClients.current[idRef.current] || smoothClients.current[idRef.current];
+      const isDeadFromServer = mySyncState?.isDead === true;
+      const isInvulnerableFromServer = typeof mySyncState?.invulnerableUntil === 'number' && mySyncState.invulnerableUntil > now;
+      const myServerScore = typeof mySyncState?.score === 'number' ? mySyncState.score : null;
+      if (Number.isFinite(myServerScore)) {
+        const recoveredFromDeath = !isDeadFromServer && wasDeadLastSync.current;
+        const serverGainedScore = myServerScore > myScore.current;
+        if (isDeadFromServer || recoveredFromDeath || serverGainedScore) {
+          myScore.current = myServerScore;
+        }
+      }
+      wasDeadLastSync.current = isDeadFromServer;
+
+      const isPositionLocked = isDeadFromServer;
+      const isAttackLocked = isDeadFromServer || isInvulnerableFromServer;
+      const sendX = isPositionLocked && typeof mySyncState?.x === 'number' ? mySyncState.x : myWorldPos.current.x;
+      const sendY = isPositionLocked && typeof mySyncState?.y === 'number' ? mySyncState.y : myWorldPos.current.y;
+      const sendSwing = isAttackLocked ? 0 : swingProgress.current;
+      const sendScore = Number.isFinite(myServerScore) && isDeadFromServer
+        ? myServerScore
+        : myScore.current;
       const angle = Math.atan2(mousePos.current.y, mousePos.current.x);
       const payload = {
-        x: myWorldPos.current.x,
-        y: myWorldPos.current.y,
+        x: sendX,
+        y: sendY,
         color: colorRef.current,
         angle,
         swordAngle: moveAngle.current,
-        swordSwing: swingProgress.current,
-        score: myScore.current,
+        swordSwing: sendSwing,
+        lastSwingTime: lastSwingTime.current,
+        score: sendScore,
         boost: boostActive.current,
         lastSeen: now,
+        updatedAt: now,
         activeEmote: activeEmoteRef.current,
         emoteAt: activeEmoteRef.current ? Math.max(0, activeEmoteUntilRef.current - EMOTE_DURATION_MS) : 0,
         emoteUntil: activeEmoteRef.current ? activeEmoteUntilRef.current : 0,
@@ -403,6 +436,77 @@ function App() {
         });
       }
     }, 50);
+
+    /**
+     * Host-authoritative respawn processor.
+     * WHY: respawn position/invulnerability must come from server state.
+     */
+    const processAuthoritativeRespawns = async () => {
+      if (!isHost.current) return;
+
+      const now = Date.now();
+      const snapshot = rawClients.current || {};
+      const respawnUpdates = {};
+
+      Object.entries(snapshot).forEach(([id, entity]) => {
+        if (!entity || entity.isDead !== true) return;
+        if (id.startsWith(BOT_ID_PREFIX)) return;
+
+        const deathAt = typeof entity.deathAt === 'number' ? entity.deathAt : 0;
+        const respawnRequestedAt = typeof entity.respawnRequestedAt === 'number' ? entity.respawnRequestedAt : 0;
+        if (!respawnRequestedAt) return;
+        if (!deathAt || now - deathAt < RESPAWN_DELAY_MS) return;
+
+        respawnUpdates[id] = {
+          x: Math.random() * WORLD_SIZE,
+          y: Math.random() * WORLD_SIZE,
+          isDead: false,
+          killerId: null,
+          invulnerableUntil: now + RESPAWN_INVULNERABLE_MS,
+          deathAt: 0,
+          updatedAt: now,
+          respawnRequestedAt: 0,
+          score: typeof entity.score === 'number' ? entity.score : 0,
+          swordSwing: 0,
+          leftPunch: 0,
+          rightPunch: 0,
+          lastSwingTime: 0,
+          lastSwingHit: null,
+          lastPunchHit: null,
+          punchStart: 0,
+          boost: false,
+        };
+      });
+
+      const entries = Object.entries(respawnUpdates);
+      if (!entries.length) return;
+
+      await Promise.all(
+        entries.map(([id, patch]) =>
+          dbUpdate(dbRef(db, `${clientsPath}/${id}`), patch),
+        ),
+      );
+    };
+
+    // Keep combat resolution off render loop; host applies authoritative kill updates.
+    const combatPoll = setInterval(() => {
+      const now = Date.now();
+      const combatPatches = buildCombatHitPatches(rawClients.current, now);
+      const writeEntries = Object.entries(combatPatches);
+      Promise.all([
+        ...writeEntries.map(([id, patch]) => dbUpdate(dbRef(db, `${clientsPath}/${id}`), patch)),
+        processAuthoritativeRespawns(),
+      ]).catch((err) => {
+        console.error('authoritative combat loop error', err);
+      });
+    }, 50);
+
+    /** Input: entity + timestamp. Output: whether entity is currently invulnerable. */
+    const isEntityInvulnerable = (entity, currentNow) => {
+      if (!entity) return false;
+      const invulnerableUntil = typeof entity.invulnerableUntil === 'number' ? entity.invulnerableUntil : 0;
+      return invulnerableUntil > currentNow;
+    };
 
     /**
      * Input: RAF timestamp.
@@ -468,9 +572,17 @@ function App() {
       }
 
       // 1. Logic di chuyển & Animation
+      const now = Date.now();
+      const myStateNow = rawClients.current[idRef.current] || smoothClients.current[idRef.current];
+      const myIsDead = myStateNow?.isDead === true;
+      const myIsInvulnerable = isEntityInvulnerable(myStateNow, now);
+      if (myIsDead) {
+        swingStart.current = 0;
+        swingProgress.current = 0;
+      }
       const dx = mousePos.current.x, dy = mousePos.current.y;
       const dist = Math.hypot(dx, dy);
-      if (dist > 10) {
+      if (!myIsDead && dist > 10) {
         moveAngle.current = getAngle(0, 0, dx, dy);
         const currentSpeed = SPEED * speedMultiplier;
         myWorldPos.current.x = Math.max(0, Math.min(WORLD_SIZE, myWorldPos.current.x + (dx / dist) * currentSpeed * dt));
@@ -480,13 +592,18 @@ function App() {
       // Reconcile local Y with authoritative room state so remote knockback is visible on victim client.
       const mySynced = smoothClients.current[idRef.current];
       if (mySynced && typeof mySynced.y === 'number') {
+        if (typeof mySynced.x === 'number') {
+          const xDeltaFromServer = mySynced.x - myWorldPos.current.x;
+          if (Math.abs(xDeltaFromServer) > 40 || mySynced.isDead === true) {
+            myWorldPos.current.x = Math.max(0, Math.min(WORLD_SIZE, mySynced.x));
+          }
+        }
         const yDeltaFromServer = mySynced.y - myWorldPos.current.y;
-        if (Math.abs(yDeltaFromServer) > 40) {
+        if (Math.abs(yDeltaFromServer) > 40 || mySynced.isDead === true) {
           myWorldPos.current.y = Math.max(0, Math.min(WORLD_SIZE, mySynced.y));
         }
       }
 
-      const now = Date.now();
       if (activeEmoteRef.current && activeEmoteUntilRef.current <= now) {
         activeEmoteRef.current = null;
         activeEmoteUntilRef.current = 0;
@@ -535,8 +652,9 @@ function App() {
         camX,
         camY,
         myWorldPos.current,
-        myRadius,
+        myIsDead ? -1e9 : myRadius,
         (food) => {
+          if (myIsDead) return;
           if (!food) return;
           const size = food.size || 1;
           if (size === 1) myScore.current += 8;
@@ -562,6 +680,10 @@ function App() {
         }
 
         const fbClient = smoothClients.current[id];
+        const rawClient = rawClients.current[id] || fbClient;
+        if (fbClient?.isDead === true) {
+          return;
+        }
         const enemyScore = typeof fbClient?.score === 'number' ? fbClient.score : 0;
         const enemyLevel = getLevelFromScore(enemyScore);
         const enemySize = getSizeFromLevel(enemyLevel);
@@ -583,67 +705,29 @@ function App() {
         const enemySwing = typeof p.swordSwing === 'number'
           ? p.swordSwing
           : Math.max(p.leftPunch || 0, p.rightPunch || 0);
+        const enemyRawSwing = typeof rawClient?.swordSwing === 'number'
+          ? rawClient.swordSwing
+          : Math.max(rawClient?.leftPunch || 0, rawClient?.rightPunch || 0);
         const enemySwordAngle =
           typeof p.swordAngle === 'number'
             ? p.swordAngle
             : (typeof p.angle === 'number' ? p.angle : 0);
+        const enemyRawSwordAngle =
+          typeof rawClient?.swordAngle === 'number'
+            ? rawClient.swordAngle
+            : (typeof rawClient?.angle === 'number' ? rawClient.angle : enemySwordAngle);
         const enemyRenderAngle = id.startsWith('bot-')
           ? (typeof p.angle === 'number' ? p.angle : enemySwordAngle)
           : enemySwordAngle;
 
         // Bot đập trúng player local
         if (id.startsWith('bot-')) {
-          const botSwingStamp = typeof p.lastPunchTime === 'number' ? p.lastPunchTime : 0;
-          if (enemySwing > 0 && botSwingStamp > 0) {
-            const botSword = getSwordWorldPoints(p.x, p.y, enemyRenderAngle, enemySize, enemySwing, 'left');
-            const bladeDistToMe = getPointToSegmentDistance(
-              myWorldPos.current.x,
-              myWorldPos.current.y,
-              botSword.handX,
-              botSword.handY,
-              botSword.tipX,
-              botSword.tipY,
-            );
-            if (bladeDistToMe < myRadius + botSword.impactRadius) {
-              if (lastBotSwingHit.current[id] !== botSwingStamp) {
-                lastBotSwingHit.current[id] = botSwingStamp;
-                myWorldPos.current.y = Math.max(0, Math.min(WORLD_SIZE, myWorldPos.current.y + KNOCKBACK_Y));
-              }
-            }
-          }
+          const botSwingStamp = typeof rawClient?.lastPunchTime === 'number' ? rawClient.lastPunchTime : 0;
+          // Combat hits are resolved authoritatively in the host combat poll.
         }
 
         // Player local chém trúng entity khác
-        if (swingProgress.current > 0) {
-          const mySword = getSwordWorldPoints(
-            myWorldPos.current.x,
-            myWorldPos.current.y,
-            mySwordAngle,
-            mySize,
-            swingProgress.current,
-            'left',
-          );
-          const bladeDistToEnemy = getPointToSegmentDistance(
-            p.x,
-            p.y,
-            mySword.handX,
-            mySword.handY,
-            mySword.tipX,
-            mySword.tipY,
-          );
-          if (bladeDistToEnemy < enemyRadius + mySword.impactRadius) {
-            if (lastSwingHit.current[id] !== lastSwingTime.current) {
-              lastSwingHit.current[id] = lastSwingTime.current;
-              const targetNow = smoothClients.current[id];
-              if (targetNow) {
-                const nextY = Math.max(0, Math.min(WORLD_SIZE, targetNow.y + KNOCKBACK_Y));
-                dbSet(dbRef(db, `${clientsPath}/${id}/y`), nextY).catch((err) => {
-                  console.error('knockback write error', err);
-                });
-              }
-            }
-          }
-        }
+        // Combat hits are resolved authoritatively in the host combat poll.
 
         drawPlayer(
           ctx,
@@ -656,6 +740,8 @@ function App() {
           enemyLabel,
           Boolean(fbClient && fbClient.boost),
           enemyLevel,
+          rawClient?.invulnerableUntil || 0,
+          rawClient?.isDead === true,
         );
 
         const enemyEmote = fbClient?.activeEmote && typeof fbClient?.emoteUntil === 'number' && fbClient.emoteUntil > now
@@ -666,35 +752,39 @@ function App() {
         }
       });
 
-            // Vẽ bản thân (size theo level)
-            const selfLabel = `Lv${myLevel} YOU`;
-            drawPlayer(
-              ctx,
-              canvas.width / 2,
-              canvas.height / 2,
-              mySwordAngle,
-              colorRef.current,
-              swingProgress.current,
-              0,
-              selfLabel,
-              boostActive.current,
-              myLevel,
-            );
+            if (!myIsDead) {
+              // Vẽ bản thân (size theo level)
+              const selfLabel = `Lv${myLevel} YOU`;
+              drawPlayer(
+                ctx,
+                canvas.width / 2,
+                canvas.height / 2,
+                mySwordAngle,
+                colorRef.current,
+                swingProgress.current,
+                0,
+                selfLabel,
+                boostActive.current,
+                myLevel,
+                rawClients.current[idRef.current]?.invulnerableUntil || 0,
+                rawClients.current[idRef.current]?.isDead === true,
+              );
 
-            const attackCooldownMs = getAttackDelayByLevel(myLevel);
-            const attackCooldownRemaining = Math.max(0, attackCooldownMs - (Date.now() - lastSwingTime.current));
-            const attackCooldownProgress = attackCooldownMs > 0 ? attackCooldownRemaining / attackCooldownMs : 0;
-            drawAttackCooldownUnderLabel(
-              ctx,
-              canvas.width / 2,
-              canvas.height / 2,
-              myLevel,
-              attackCooldownProgress,
-            );
+              const attackCooldownMs = getAttackDelayByLevel(myLevel);
+              const attackCooldownRemaining = Math.max(0, attackCooldownMs - (Date.now() - lastSwingTime.current));
+              const attackCooldownProgress = attackCooldownMs > 0 ? attackCooldownRemaining / attackCooldownMs : 0;
+              drawAttackCooldownUnderLabel(
+                ctx,
+                canvas.width / 2,
+                canvas.height / 2,
+                myLevel,
+                attackCooldownProgress,
+              );
 
-            const localEmote = activeEmoteRef.current ? getEmoteById(activeEmoteRef.current) : null;
-            if (localEmote && activeEmoteUntilRef.current > now) {
-              drawEmoteBubble(ctx, canvas.width / 2, canvas.height / 2, localEmote.icon, myLevel, 1.6);
+              const localEmote = activeEmoteRef.current ? getEmoteById(activeEmoteRef.current) : null;
+              if (localEmote && activeEmoteUntilRef.current > now) {
+                drawEmoteBubble(ctx, canvas.width / 2, canvas.height / 2, localEmote.icon, myLevel, 1.6);
+              }
             }
 
       requestAnimationFrame(gameLoop);
@@ -713,6 +803,7 @@ function App() {
       dbRemove(userRef);
       clearInterval(hostPoll);
       clearInterval(networkPoll);
+      clearInterval(combatPoll);
     };
   }, []);
 
@@ -724,9 +815,32 @@ function App() {
     Date.now(),
   );
 
+  const localClientState = smoothClients.current[idRef.current] || null;
+  const isLocalDead = localClientState?.isDead === true;
+  const killerId = localClientState?.killerId || null;
+  const killerClient = killerId ? smoothClients.current[killerId] : null;
+  const killerName = killerClient?.name
+    || (killerId && killerId.startsWith(BOT_ID_PREFIX) ? 'Bot' : null)
+    || (killerId ? killerId.slice(0, 4).toUpperCase() : 'Unknown');
+
+  /**
+   * Request respawn through Firebase; host authoritative loop performs actual respawn.
+   */
+  const requestRespawn = () => {
+    if (!isLocalDead) return;
+    const now = Date.now();
+    dbUpdate(dbRef(db, `${getRoomCollectionPath(roomId, 'clients')}/${idRef.current}`), {
+      respawnRequestedAt: now,
+      updatedAt: now,
+    }).catch((err) => {
+      console.error('request respawn error', err);
+    });
+  };
+
   return (
     <div style={{ width: '100vw', height: '100vh', overflow: 'hidden', background: '#1a1a1a' }}>
-      <canvas ref={canvasRef} style={{ display: 'block' }} />
+      <canvas ref={canvasRef} style={{ display: 'block', pointerEvents: 'none' }} />
+      <DeathOverlay visible={isLocalDead} killerName={killerName} onRespawn={requestRespawn} />
       <GameHud hud={hudState} />
       <RoomChatBox messages={chatMessages} />
       <EmoteWheel visible={isEmoteWheelOpen} center={emoteWheelCenter} hoveredIndex={emoteHoveredIndex} />

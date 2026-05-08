@@ -37,6 +37,8 @@ export const drawPlayer = (
   label,
   isBoosting,
   level,
+  invulnerableUntil = 0,
+  isDead = false,
 ) => {
   const bodySize = typeof level === 'number' ? getSizeFromLevel(level) : PLAYER_SIZE;
   const swingP = Math.max(0, Math.min(1, Math.max(leftPunch || 0, rightPunch || 0)));
@@ -50,6 +52,10 @@ export const drawPlayer = (
   const handY = Math.sin(sweep) * handReach;
   const tipX = handX + Math.cos(sweep) * bladeLength;
   const tipY = handY + Math.sin(sweep) * bladeLength;
+  const now = Date.now();
+  const isInvulnerable = !isDead && typeof invulnerableUntil === 'number' && invulnerableUntil > now;
+
+  if (isDead) return;
 
   ctx.save();
   ctx.translate(x, y);
@@ -58,6 +64,8 @@ export const drawPlayer = (
   ctx.shadowBlur = 10;
   ctx.shadowColor = 'rgba(0,0,0,0.3)';
   ctx.shadowOffsetY = 4;
+
+  ctx.globalAlpha = isInvulnerable ? 0.5 : 1;
 
   // Body
   ctx.fillStyle = color;
@@ -154,6 +162,7 @@ export const drawPlayer = (
   }
 
   ctx.restore();
+  ctx.globalAlpha = 1;
 
   // Label (upright)
   ctx.save();
@@ -216,6 +225,7 @@ export const drawPlayer = (
   }
 
   ctx.restore();
+  ctx.globalAlpha = 1;
 };
 
 /**

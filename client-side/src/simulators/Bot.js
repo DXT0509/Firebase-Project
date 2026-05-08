@@ -12,7 +12,7 @@
  * - Simulation runs on raw snapshots (not smoothed render state).
  * - All writes are room-scoped; root-path writes will desync rooms.
  */
-import { ref as dbRef, get, set as dbSet, remove as dbRemove } from 'firebase/database';
+import { ref as dbRef, get, set as dbSet, update as dbUpdate, remove as dbRemove } from 'firebase/database';
 import { db } from '../firebase/config';
 import { getRoomCollectionPath } from '../firebase/paths';
 import {
@@ -24,9 +24,9 @@ import {
 	BOT_SPEED,
 	BOT_HIT_PUSH_Y,
 	BOT_ID_PREFIX,
+	RESPAWN_INVULNERABLE_MS,
 } from '../constants/gameConfig';
-import { getLevelFromScore, getSizeFromLevel, getSwordWorldPoints } from '../utils/physics';
-import { getPointToSegmentDistance } from '../utils/math';
+import { getLevelFromScore, getSizeFromLevel } from '../utils/physics';
 
 // Performance-sensitive: persisted between ticks to keep speed frame-rate independent.
 let lastBotSimTs = 0;
@@ -138,9 +138,47 @@ const createBotPayload = (x, y) => {
 		nextPunchHand: 0,
 		lastPunchTime: 0,
 		score: 0,
+		respawnAt: 0,
+		updatedAt: Date.now(),
 		boost: false,
 		lastSeen: Date.now(),
 		name: 'BOT',
+	};
+};
+
+/** Input: none. Output: random bot spawn location. */
+const getRandomSpawnPosition = () => ({
+	x: Math.random() * WORLD_SIZE,
+	y: Math.random() * WORLD_SIZE,
+});
+
+/**
+ * Inputs: dead bot payload and current timestamp.
+ * Output: bot payload reset for respawn.
+ */
+const respawnBotPayload = (bot, now) => {
+	const spawn = getRandomSpawnPosition();
+	return {
+		...bot,
+		x: spawn.x,
+		y: spawn.y,
+		angle: Math.random() * Math.PI * 2,
+		swordAngle: 0,
+		swordSwing: 0,
+		leftPunch: 0,
+		rightPunch: 0,
+		punchHand: 0,
+		punchStart: 0,
+		nextPunchHand: 0,
+		lastPunchTime: 0,
+		lastPunchHit: null,
+		isDead: false,
+		killerId: null,
+		respawnAt: 0,
+		invulnerableUntil: now + RESPAWN_INVULNERABLE_MS,
+		updatedAt: now,
+		boost: false,
+		lastSeen: now,
 	};
 };
 
@@ -152,6 +190,18 @@ const createBotPayload = (x, y) => {
  * - Derived punch/swing state for this tick.
  */
 const getBotPunchState = (bot, now) => {
+	if (!bot || bot.isDead === true || isEntityInvulnerable(bot, now)) {
+		return {
+			leftPunch: 0,
+			rightPunch: 0,
+			swordSwing: 0,
+			punchHand: typeof bot?.punchHand === 'number' ? bot.punchHand : 0,
+			punchStart: 0,
+			nextPunchHand: typeof bot?.nextPunchHand === 'number' ? bot.nextPunchHand : 0,
+			lastPunchTime: typeof bot?.lastPunchTime === 'number' ? bot.lastPunchTime : 0,
+		};
+	}
+
 	let punchHand = typeof bot.punchHand === 'number' ? bot.punchHand : 0;
 	let punchStart = typeof bot.punchStart === 'number' ? bot.punchStart : 0;
 	let nextPunchHand = bot.nextPunchHand === 1 ? 1 : 0;
@@ -205,6 +255,13 @@ const withBotCombatPose = (bot, angle, punchState) => {
 
 /** Input: coordinate value. Output: value clamped to world bounds. */
 const clampWorld = (value) => Math.max(0, Math.min(WORLD_SIZE, value));
+
+/** Input: entity + timestamp. Output: whether entity is currently invulnerable. */
+const isEntityInvulnerable = (entity, now) => {
+	if (!entity) return false;
+	const invulnerableUntil = typeof entity.invulnerableUntil === 'number' ? entity.invulnerableUntil : 0;
+	return invulnerableUntil > now;
+};
 
 /**
  * Input: bot payload.
@@ -401,75 +458,91 @@ export const updateBotsTowardFood = async (allClientsOverride, allFoodOverride, 
 	const foodsToRemove = [];
 	const hasFood = Object.keys(allFood).length > 0;
 
+	Object.entries(botClients).forEach(([id, bot]) => {
+		if (!bot || bot.isDead !== true) return;
+		const respawnAt = typeof bot.respawnAt === 'number' ? bot.respawnAt : 0;
+		console.log('[bot-respawn-check]', id, { now, respawnAt, isDead: bot.isDead });
+		if (!respawnAt || now < respawnAt) return;
+		console.log('[bot-respawn]', id, { now, respawnAt });
+		updatedBots[id] = respawnBotPayload(bot, now);
+	});
+
 	if (!hasFood) {
 		// Không có food thì vẫn di chuyển nhẹ + spam punch theo cooldown player
 		Object.entries(botClients).forEach(([id, bot]) => {
+			const botState = updatedBots[id] || bot;
+			if (!botState || botState.isDead === true) return;
 			const angle = Math.random() * Math.PI * 2;
-			const nx = Math.max(0, Math.min(WORLD_SIZE, bot.x + Math.cos(angle) * botStep));
-			const ny = Math.max(0, Math.min(WORLD_SIZE, bot.y + Math.sin(angle) * botStep));
-			const punchState = getBotPunchState(bot, now);
+			const nx = Math.max(0, Math.min(WORLD_SIZE, botState.x + Math.cos(angle) * botStep));
+			const ny = Math.max(0, Math.min(WORLD_SIZE, botState.y + Math.sin(angle) * botStep));
+			const punchState = getBotPunchState(botState, now);
 
 			updatedBots[id] = withBotCombatPose({
-				...bot,
+				...botState,
 				x: nx,
 				y: ny,
 				angle,
 				lastSeen: now,
+				updatedAt: now,
 			}, angle, punchState);
 		});
 	}
 
 	Object.entries(botClients).forEach(([id, bot]) => {
-		if (!bot || typeof bot.x !== 'number' || typeof bot.y !== 'number') return;
+		const botState = updatedBots[id] || bot;
+		if (!botState || typeof botState.x !== 'number' || typeof botState.y !== 'number') return;
+		if (botState.isDead === true) return;
 		if (!hasFood) return;
-		const nearest = findNearestFood(bot, allFood);
+		const nearest = findNearestFood(botState, allFood);
 		if (!nearest) {
 			// fallback: di chuyển random
 			const angle = Math.random() * Math.PI * 2;
-			const nx = bot.x + Math.cos(angle) * botStep;
-			const ny = bot.y + Math.sin(angle) * botStep;
-			const punchState = getBotPunchState(bot, now);
+			const nx = botState.x + Math.cos(angle) * botStep;
+			const ny = botState.y + Math.sin(angle) * botStep;
+			const punchState = getBotPunchState(botState, now);
 
 			updatedBots[id] = withBotCombatPose({
-				...bot,
+				...botState,
 				x: nx,
 				y: ny,
 				angle,
 				lastSeen: now,
+				updatedAt: now,
 			}, angle, punchState);
 			return;
 		}
 
 		const { id: foodId, food: targetFood } = nearest;
-		const dx = targetFood.x - bot.x;
-		const dy = targetFood.y - bot.y;
+		const dx = targetFood.x - botState.x;
+		const dy = targetFood.y - botState.y;
 		const dist = Math.hypot(dx, dy);
-		const punchState = getBotPunchState(bot, now);
+		const punchState = getBotPunchState(botState, now);
 		if (!dist) {
 			// Tránh đứng im: khi trùng đúng tọa độ food thì vẫn random nhẹ
 			const angle = Math.random() * Math.PI * 2;
-			const nx = clampWorld(bot.x + Math.cos(angle) * botStep);
-			const ny = clampWorld(bot.y + Math.sin(angle) * botStep);
+			const nx = clampWorld(botState.x + Math.cos(angle) * botStep);
+			const ny = clampWorld(botState.y + Math.sin(angle) * botStep);
 			updatedBots[id] = withBotCombatPose({
-				...bot,
+				...botState,
 				x: nx,
 				y: ny,
 				angle,
 				lastSeen: now,
+				updatedAt: now,
 			}, angle, punchState);
 			return;
 		}
 
 		const step = Math.min(botStep, dist); // không overshoot
-		let nx = bot.x + (dx / dist) * step;
-		let ny = bot.y + (dy / dist) * step;
+		let nx = botState.x + (dx / dist) * step;
+		let ny = botState.y + (dy / dist) * step;
 		nx = clampWorld(nx);
 		ny = clampWorld(ny);
 		const angle = Math.atan2(dy, dx);
 
 		// Nếu sau bước di chuyển này bot gần food đủ để coi như ăn
 		const willReachFood = dist <= botStep + 2;
-		let newScore = typeof bot.score === 'number' ? bot.score : 0;
+		let newScore = typeof botState.score === 'number' ? botState.score : 0;
 		if (willReachFood && foodId && allFood[foodId]) {
 			const size = allFood[foodId].size || 1;
 			if (size === 1) newScore += 8;
@@ -482,60 +555,14 @@ export const updateBotsTowardFood = async (allClientsOverride, allFoodOverride, 
 		}
 
 		updatedBots[id] = withBotCombatPose({
-			...bot,
+			...botState,
 			x: nx,
 			y: ny,
 			angle,
 			lastSeen: now,
+			updatedAt: now,
 			score: newScore,
 		}, angle, punchState);
-	});
-
-	// Bot sword hit detection: bot có thể chém trúng player hoặc bot khác
-	const projectedClients = { ...allClients, ...updatedBots };
-	const yPushById = {};
-
-	Object.entries(updatedBots).forEach(([attackerId, attacker]) => {
-		if (!attacker || typeof attacker.x !== 'number' || typeof attacker.y !== 'number') return;
-		const swordSwing = typeof attacker.swordSwing === 'number' ? attacker.swordSwing : 0;
-		if (swordSwing <= 0) return;
-
-		const hitMemo = attacker.lastPunchHit && typeof attacker.lastPunchHit === 'object'
-			? { ...attacker.lastPunchHit }
-			: {};
-		const punchStamp = typeof attacker.lastPunchTime === 'number' ? attacker.lastPunchTime : 0;
-
-		Object.entries(projectedClients).forEach(([targetId, target]) => {
-			if (targetId === attackerId) return;
-			if (!target || typeof target.x !== 'number' || typeof target.y !== 'number') return;
-			if (hitMemo[targetId] === punchStamp) return;
-
-			if (isSwordSegmentHit(attacker, target)) {
-				hitMemo[targetId] = punchStamp;
-				yPushById[targetId] = (yPushById[targetId] || 0) + BOT_HIT_PUSH_Y;
-			}
-		});
-
-		updatedBots[attackerId] = {
-			...attacker,
-			lastPunchHit: hitMemo,
-		};
-	});
-
-	const humanYWrites = [];
-	Object.entries(yPushById).forEach(([targetId, pushY]) => {
-		const targetNow = projectedClients[targetId];
-		if (!targetNow || typeof targetNow.y !== 'number') return;
-		const nextY = clampWorld(targetNow.y + pushY);
-		if (targetId.startsWith(BOT_ID_PREFIX) && updatedBots[targetId]) {
-			updatedBots[targetId] = {
-				...updatedBots[targetId],
-				y: nextY,
-			};
-			return;
-		}
-
-		humanYWrites.push(dbSet(dbRef(db, `${clientsPath}/${targetId}/y`), nextY));
 	});
 
 	// Per-entity cập nhật cho bot + xoá food bị ăn, tránh overwrite toàn bộ node
@@ -547,7 +574,7 @@ export const updateBotsTowardFood = async (allClientsOverride, allFoodOverride, 
 		foodId ? dbRemove(dbRef(db, `${foodPath}/${foodId}`)) : Promise.resolve(),
 	);
 
-	await Promise.all([...botWrites, ...humanYWrites, ...foodDeletes]);
+	await Promise.all([...botWrites, ...foodDeletes]);
 };
 
 // Tuỳ theo cách bạn dùng:

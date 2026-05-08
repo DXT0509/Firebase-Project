@@ -43,6 +43,16 @@ export const getSizeFromLevel = (level) => {
 };
 
 /**
+ * Input: level value.
+ * Output: minimum score required for that level.
+ */
+export const getScoreFloorForLevel = (level) => {
+  const safeLevel = Math.max(1, Math.min(MAX_LEVEL, Number.isFinite(level) ? level : 1));
+  const entry = EVOWARS_XP_TABLE.find((row) => row.level === safeLevel);
+  return entry ? entry.score : 0;
+};
+
+/**
  * Inputs:
  * - Player transform, body size, swing progress, and hand side.
  *
