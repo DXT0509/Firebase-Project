@@ -63,7 +63,7 @@ import { buildCombatHitPatches } from './utils/combat';
 import GameHud from './components/GameHud';
 import RoomChatBox from './components/RoomChatBox';
 import ChatInputOverlay from './components/ChatInputOverlay';
-import DeathOverlay from './components/DeathOverlay';
+import MainMenu from './components/MainMenu';
 import { getRoomCollectionPath } from './firebase/paths';
 import EmoteWheel from './components/EmoteWheel';
 import { EMOTE_OPTIONS, EMOTE_DURATION_MS, getEmoteById } from './constants/emotes';
@@ -78,6 +78,9 @@ function App() {
   const [isEmoteWheelOpen, setIsEmoteWheelOpen] = useState(false);
   const [emoteWheelCenter, setEmoteWheelCenter] = useState(null);
   const [emoteHoveredIndex, setEmoteHoveredIndex] = useState(-1);
+  const [gameState, setGameState] = useState('menu');
+  const [playerName, setPlayerName] = useState('');
+  const [killerName, setKillerName] = useState(null);
   const roomId = DEFAULT_ROOM_ID;
 
   // Refs quản lý logic (không gây re-render)
@@ -115,8 +118,49 @@ function App() {
   const emoteWheelCenterRef = useRef(null);
   const activeEmoteRef = useRef(null);
   const activeEmoteUntilRef = useRef(0);
+  const gameStateRef = useRef('menu');
+  const playerNameRef = useRef('');
+  const respawnPendingRef = useRef(false);
 
   const { smoothClients, foodItems, chatMessages, rawClients, rawFoodItems } = useGameSync(roomId, idRef.current);
+
+  useEffect(() => {
+    gameStateRef.current = gameState;
+  }, [gameState]);
+
+  useEffect(() => {
+    playerNameRef.current = playerName;
+  }, [playerName]);
+
+  useEffect(() => {
+    if (gameState !== 'playing') return undefined;
+
+    const deathWatcher = window.setInterval(() => {
+      const localRawState = rawClients.current[idRef.current];
+      if (!localRawState) return;
+      if (localRawState.isDead !== true) {
+        respawnPendingRef.current = false;
+        return;
+      }
+      if (respawnPendingRef.current) return;
+
+      const killerId = localRawState.killerId || null;
+      const killerRawState = killerId ? rawClients.current[killerId] : null;
+      const nextKillerName = killerRawState?.name
+        || (killerId && killerId.startsWith(BOT_ID_PREFIX) ? 'Bot' : null)
+        || (killerId ? killerId.slice(0, 4).toUpperCase() : 'Unknown');
+
+      setKillerName(nextKillerName);
+      gameStateRef.current = 'dead';
+      setGameState('dead');
+      setIsChatInputOpen(false);
+      setIsEmoteWheelOpen(false);
+    }, 100);
+
+    return () => {
+      window.clearInterval(deathWatcher);
+    };
+  }, [gameState, rawClients]);
 
   // Keep chat input focus behavior deterministic across open/close cycles.
   useEffect(() => {
@@ -133,8 +177,13 @@ function App() {
   }, [chatDraft]);
 
   useEffect(() => {
+    if (gameState !== 'playing') return undefined;
+
     const canvas = canvasRef.current;
+    if (!canvas) return undefined;
+
     const ctx = canvas.getContext('2d');
+    let raf = 0;
 
     /** Inputs: none. Output: resizes canvas to viewport bounds. */
     const handleResize = () => {
@@ -266,6 +315,7 @@ function App() {
         if (!trimmed) return;
 
         const senderName =
+          playerNameRef.current ||
           smoothClients.current?.[idRef.current]?.name ||
           idRef.current.slice(0, 4).toUpperCase();
         const chatRef = dbRef(db, getRoomCollectionPath(roomId, 'chat'));
@@ -408,6 +458,7 @@ function App() {
         swordSwing: sendSwing,
         lastSwingTime: lastSwingTime.current,
         score: sendScore,
+        name: playerNameRef.current || idRef.current.slice(0, 4).toUpperCase(),
         boost: boostActive.current,
         lastSeen: now,
         updatedAt: now,
@@ -787,10 +838,10 @@ function App() {
               }
             }
 
-      requestAnimationFrame(gameLoop);
+      raf = requestAnimationFrame(gameLoop);
     };
 
-    const raf = requestAnimationFrame(gameLoop);
+    raf = requestAnimationFrame(gameLoop);
     return () => {
       window.removeEventListener('resize', handleResize);
       window.removeEventListener('mousemove', handleMouseMove);
@@ -800,12 +851,14 @@ function App() {
       window.removeEventListener('keyup', handleKeyUp);
       window.removeEventListener('contextmenu', handleContextMenu);
       cancelAnimationFrame(raf);
-      dbRemove(userRef);
+      if (gameStateRef.current !== 'dead') {
+        dbRemove(userRef);
+      }
       clearInterval(hostPoll);
       clearInterval(networkPoll);
       clearInterval(combatPoll);
     };
-  }, []);
+  }, [gameState, foodItems, rawClients, rawFoodItems, roomId, smoothClients]);
 
   const hudState = buildHudState(
     smoothClients.current,
@@ -815,41 +868,118 @@ function App() {
     Date.now(),
   );
 
-  const localClientState = smoothClients.current[idRef.current] || null;
-  const isLocalDead = localClientState?.isDead === true;
-  const killerId = localClientState?.killerId || null;
-  const killerClient = killerId ? smoothClients.current[killerId] : null;
-  const killerName = killerClient?.name
-    || (killerId && killerId.startsWith(BOT_ID_PREFIX) ? 'Bot' : null)
-    || (killerId ? killerId.slice(0, 4).toUpperCase() : 'Unknown');
+  const handlePlay = (nextPlayerName) => {
+    const safePlayerName = String(nextPlayerName || '').trim().slice(0, 16);
+    if (!safePlayerName) return;
 
-  /**
-   * Request respawn through Firebase; host authoritative loop performs actual respawn.
-   */
-  const requestRespawn = () => {
-    if (!isLocalDead) return;
     const now = Date.now();
-    dbUpdate(dbRef(db, `${getRoomCollectionPath(roomId, 'clients')}/${idRef.current}`), {
-      respawnRequestedAt: now,
+    const localRawState = rawClients.current[idRef.current] || null;
+    const isRespawningFromDeath = localRawState?.isDead === true;
+    const startX = typeof localRawState?.x === 'number' && !isRespawningFromDeath
+      ? localRawState.x
+      : Math.random() * WORLD_SIZE;
+    const startY = typeof localRawState?.y === 'number' && !isRespawningFromDeath
+      ? localRawState.y
+      : Math.random() * WORLD_SIZE;
+    const startingScore = isRespawningFromDeath && typeof localRawState?.score === 'number'
+      ? localRawState.score
+      : 0;
+
+    playerNameRef.current = safePlayerName;
+    setPlayerName(safePlayerName);
+    setKillerName(null);
+    setIsChatInputOpen(false);
+    setChatDraft('');
+    setIsEmoteWheelOpen(false);
+    setEmoteWheelCenter(null);
+    setEmoteHoveredIndex(-1);
+
+    myWorldPos.current = { x: startX, y: startY };
+    mousePos.current = { x: 0, y: 0 };
+    moveAngle.current = 0;
+    swingStart.current = 0;
+    swingProgress.current = 0;
+    lastSwingTime.current = 0;
+    lastSwingHit.current = {};
+    lastBotSwingHit.current = {};
+    lastTime.current = 0;
+    lastSent.current = 0;
+    lastBotUpdate.current = 0;
+    lastEnsureBots.current = 0;
+    lastFoodSpawn.current = 0;
+    lastSentState.current = null;
+    myScore.current = startingScore;
+    wasDeadLastSync.current = isRespawningFromDeath;
+    shiftPressed.current = false;
+    boostActive.current = false;
+    boostScoreAccumulator.current = 0;
+    activeEmoteRef.current = null;
+    activeEmoteUntilRef.current = 0;
+    respawnPendingRef.current = isRespawningFromDeath;
+
+    const clientsPath = getRoomCollectionPath(roomId, 'clients');
+    dbUpdate(dbRef(db, `${clientsPath}/${idRef.current}`), {
+      name: safePlayerName,
+      color: colorRef.current,
+      boost: false,
+      swordSwing: 0,
+      leftPunch: 0,
+      rightPunch: 0,
+      lastSwingTime: 0,
+      activeEmote: null,
+      emoteAt: 0,
+      emoteUntil: 0,
+      ...(isRespawningFromDeath
+        ? {
+            respawnRequestedAt: now,
+          }
+        : {
+            x: startX,
+            y: startY,
+            angle: 0,
+            swordAngle: 0,
+            score: 0,
+            isDead: false,
+            killerId: null,
+            deathAt: 0,
+            invulnerableUntil: 0,
+            respawnRequestedAt: 0,
+          }),
+      lastSeen: now,
       updatedAt: now,
     }).catch((err) => {
-      console.error('request respawn error', err);
+      console.error('start game error', err);
     });
+
+    gameStateRef.current = 'playing';
+    setGameState('playing');
   };
 
   return (
     <div style={{ width: '100vw', height: '100vh', overflow: 'hidden', background: '#1a1a1a' }}>
-      <canvas ref={canvasRef} style={{ display: 'block', pointerEvents: 'none' }} />
-      <DeathOverlay visible={isLocalDead} killerName={killerName} onRespawn={requestRespawn} />
-      <GameHud hud={hudState} />
-      <RoomChatBox messages={chatMessages} />
-      <EmoteWheel visible={isEmoteWheelOpen} center={emoteWheelCenter} hoveredIndex={emoteHoveredIndex} />
-      {isChatInputOpen && (
-        <ChatInputOverlay
-          value={chatDraft}
-          onChange={(e) => setChatDraft(e.target.value)}
-          inputRef={chatInputRef}
+      {(gameState === 'menu' || gameState === 'dead') && (
+        <MainMenu
+          mode={gameState}
+          killerName={killerName}
+          roomId={roomId}
+          onPlay={handlePlay}
         />
+      )}
+
+      {gameState === 'playing' && (
+        <>
+          <canvas ref={canvasRef} style={{ display: 'block', pointerEvents: 'none' }} />
+          <GameHud hud={hudState} />
+          <RoomChatBox messages={chatMessages} />
+          <EmoteWheel visible={isEmoteWheelOpen} center={emoteWheelCenter} hoveredIndex={emoteHoveredIndex} />
+          {isChatInputOpen && (
+            <ChatInputOverlay
+              value={chatDraft}
+              onChange={(e) => setChatDraft(e.target.value)}
+              inputRef={chatInputRef}
+            />
+          )}
+        </>
       )}
     </div>
   );
