@@ -10,6 +10,7 @@ lerna-debug.log*
 
 simulators/node_modules/
 client-side/node_modules/
+node_modules/
 dist
 dist-ssr
 *.local
@@ -24,3 +25,4 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+*.md

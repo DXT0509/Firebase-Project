@@ -1,3 +1,14 @@
+/**
+ * Purpose:
+ * - Initialize and export Firebase app + Realtime Database singleton.
+ *
+ * Responsibilities:
+ * - Hold project connection metadata.
+ * - Expose initialized `db` object for all network modules.
+ *
+ * Key concepts:
+ * - Must remain a singleton module to avoid duplicate app initialization.
+ */
 import { initializeApp } from "firebase/app";
 import { getDatabase } from "firebase/database"; // Thêm dòng này để dùng Realtime Database
 
@@ -13,7 +24,7 @@ const firebaseConfig = {
 databaseURL: "https://smart-logistics-uet-default-rtdb.asia-southeast1.firebasedatabase.app"
 };
 
-// Khởi tạo Firebase
+// Khởi tạo Firebase (singleton for this client bundle).
 const app = initializeApp(firebaseConfig);
 
 // Khởi tạo Realtime Database và export để các file khác (services) sử dụng
