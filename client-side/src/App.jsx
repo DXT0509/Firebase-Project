@@ -60,6 +60,7 @@ import { drawGrid, drawFood } from './renderer/worldRenderer';
 import { useGameSync } from './hooks/useGameSync';
 import { buildHudState } from './utils/hudState';
 import { buildCombatHitPatches } from './utils/combat';
+import { consumeFoodTransaction, getFoodScoreValue } from './utils/foodConsumption';
 import GameHud from './components/GameHud';
 import RoomChatBox from './components/RoomChatBox';
 import ChatInputOverlay from './components/ChatInputOverlay';
@@ -105,6 +106,7 @@ function App() {
   const lastSentState = useRef(null);
   const myScore = useRef(0);
   const lastLocalScoreMutationAt = useRef(0);
+  const pendingFoodConsume = useRef(new Set());
   const wasDeadLastSync = useRef(false);
   const shiftPressed = useRef(false);
   const boostActive = useRef(false);
@@ -703,30 +705,31 @@ function App() {
       const mySize = getSizeFromLevel(myLevel);
       const myRadius = mySize / 2;
 
-      const foodsToRemove = drawFood(
+      drawFood(
         ctx,
-        foodItems.current,
+        rawFoodItems.current,
         camX,
         camY,
         myWorldPos.current,
         myIsDead ? -1e9 : myRadius,
-        (food) => {
+        async (food, foodId) => {
           if (myIsDead) return;
-          if (!food) return;
-          const size = food.size || 1;
-          if (size === 1) myScore.current += 8;
-          else if (size === 2) myScore.current += 19;
-          else myScore.current += 40;
-          lastLocalScoreMutationAt.current = Date.now();
+          if (!foodId || pendingFoodConsume.current.has(foodId)) return;
+
+          pendingFoodConsume.current.add(foodId);
+          try {
+            const result = await consumeFoodTransaction(db, roomId, foodId);
+            if (result.committed) {
+              myScore.current += getFoodScoreValue(food?.size || 1);
+              lastLocalScoreMutationAt.current = Date.now();
+            }
+          } catch (err) {
+            console.error('consumeFood error', err);
+          } finally {
+            pendingFoodConsume.current.delete(foodId);
+          }
         },
       );
-
-      if (foodsToRemove.length > 0) {
-        foodsToRemove.forEach((id) => {
-          const fRef = dbRef(db, `${getRoomCollectionPath(roomId, 'food')}/${id}`);
-          dbRemove(fRef);
-        });
-      }
 
       // Vẽ người chơi khác
       Object.entries(smoothClients.current).forEach(([id, p]) => {

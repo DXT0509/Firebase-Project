@@ -12,9 +12,10 @@
  * - Simulation runs on raw snapshots (not smoothed render state).
  * - All writes are room-scoped; root-path writes will desync rooms.
  */
-import { ref as dbRef, get, set as dbSet, update as dbUpdate, remove as dbRemove } from 'firebase/database';
+import { ref as dbRef, get, set as dbSet } from 'firebase/database';
 import { db } from '../firebase/config';
 import { getRoomCollectionPath } from '../firebase/paths';
+import { consumeFoodTransaction, getFoodScoreValue } from '../utils/foodConsumption';
 import {
 	WORLD_SIZE,
 	PUNCH_DURATION,
@@ -455,7 +456,7 @@ export const updateBotsTowardFood = async (allClientsOverride, allFoodOverride, 
 	lastBotSimTs = now;
 	const botStep = BOT_SPEED * simDt;
 	const updatedBots = { ...botClients };
-	const foodsToRemove = [];
+	const botWritePromises = [];
 	const hasFood = Object.keys(allFood).length > 0;
 
 	Object.entries(botClients).forEach(([id, bot]) => {
@@ -544,14 +545,31 @@ export const updateBotsTowardFood = async (allClientsOverride, allFoodOverride, 
 		const willReachFood = dist <= botStep + 2;
 		let newScore = typeof botState.score === 'number' ? botState.score : 0;
 		if (willReachFood && foodId && allFood[foodId]) {
-			const size = allFood[foodId].size || 1;
-			if (size === 1) newScore += 8;
-			else if (size === 2) newScore += 19;
-			else newScore += 40;
+			const scoreDelta = getFoodScoreValue(allFood[foodId].size || 1);
 			// Xoá food này khỏi pool để các bot khác chọn mục tiêu mới
 			const { [foodId]: _removed, ...rest } = allFood;
 			allFood = rest;
-			foodsToRemove.push(foodId);
+			botWritePromises.push(
+				consumeFoodTransaction(db, roomId, foodId)
+					.then((result) => {
+						const committed = result?.committed === true;
+						const nextScore = committed ? newScore + scoreDelta : newScore;
+						updatedBots[id] = withBotCombatPose({
+							...botState,
+							x: nx,
+							y: ny,
+							angle,
+							lastSeen: now,
+							updatedAt: now,
+							score: nextScore,
+						}, angle, punchState);
+						return dbSet(dbRef(db, `${clientsPath}/${id}`), sanitizeBotForDb(updatedBots[id]));
+					})
+					.catch((err) => {
+						console.error('consumeFoodTransaction error', err);
+					}),
+			);
+			return;
 		}
 
 		updatedBots[id] = withBotCombatPose({
@@ -563,18 +581,13 @@ export const updateBotsTowardFood = async (allClientsOverride, allFoodOverride, 
 			updatedAt: now,
 			score: newScore,
 		}, angle, punchState);
+		botWritePromises.push(
+			dbSet(dbRef(db, `${clientsPath}/${id}`), sanitizeBotForDb(updatedBots[id])),
+		);
 	});
 
 	// Per-entity cập nhật cho bot + xoá food bị ăn, tránh overwrite toàn bộ node
-	const botWrites = Object.entries(updatedBots).map(([id, bot]) =>
-		dbSet(dbRef(db, `${clientsPath}/${id}`), sanitizeBotForDb(bot)),
-	);
-
-	const foodDeletes = foodsToRemove.map((foodId) =>
-		foodId ? dbRemove(dbRef(db, `${foodPath}/${foodId}`)) : Promise.resolve(),
-	);
-
-	await Promise.all([...botWrites, ...foodDeletes]);
+	await Promise.all(botWritePromises);
 };
 
 // Tuỳ theo cách bạn dùng:
