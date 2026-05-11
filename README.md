@@ -1,6 +1,3 @@
-<<<<<<< HEAD
-## This project is in progress at branch DaoXuanThao
-=======
 # Firebase Realtime Project ⚡🔥
 
 Đây là dự án frontend sử dụng Firebase Realtime Database để xây dựng trải nghiệm realtime multiplayer trên nền React và Canvas.
