@@ -1,6 +1,20 @@
-import { BOT_ID_PREFIX } from '../constants/gameConfig';
+import { BOT_ID_PREFIX, MAX_LEVEL } from '../constants/gameConfig';
 import { getLevelFromScore, getScoreFloorForLevel, getSizeFromLevel, getSwordWorldPoints } from './physics';
 import { getPointToSegmentDistance } from './math';
+
+const MIN_KILL_EXP_GAIN = 100;
+const MAX_LEVEL_SCORE_FLOOR = getScoreFloorForLevel(MAX_LEVEL);
+
+export const buildKillScoreDelta = (victimScore) => {
+  const safeVictimScore = Math.max(0, Number.isFinite(victimScore) ? victimScore : 0);
+  const victimLevel = getLevelFromScore(safeVictimScore);
+  const scoreBase = victimLevel >= MAX_LEVEL ? MAX_LEVEL_SCORE_FLOOR : safeVictimScore;
+
+  return {
+    attackerGain: Math.max(MIN_KILL_EXP_GAIN, Math.floor(scoreBase / 4)),
+    victimScoreAfterDeath: Math.floor(scoreBase * 4 / 5),
+  };
+};
 
 /**
  * Inputs:
@@ -87,16 +101,14 @@ export const buildCombatHitPatches = (rawClients, now) => {
       hitMemo[targetId] = swingStamp;
 
       const victimScore = Number.isFinite(targetProjected.score) ? targetProjected.score : 0;
-      const victimLevel = getLevelFromScore(victimScore);
-      const victimLevelAfterDeath = Math.max(1, victimLevel - 2);
-      const victimScoreAfterDeath = getScoreFloorForLevel(victimLevelAfterDeath);
+      const { attackerGain, victimScoreAfterDeath } = buildKillScoreDelta(victimScore);
 
       const attackerScoreBase = Number.isFinite((mergedUpdates[attackerId] || {}).score)
         ? (mergedUpdates[attackerId] || {}).score
         : attackerScoreForGeometry;
       mergedUpdates[attackerId] = {
         ...(mergedUpdates[attackerId] || {}),
-        score: attackerScoreBase + victimScore,
+        score: attackerScoreBase + attackerGain,
         updatedAt: now,
         [memoKey]: hitMemo,
       };
@@ -106,6 +118,7 @@ export const buildCombatHitPatches = (rawClients, now) => {
         score: victimScoreAfterDeath,
         isDead: true,
         killerId: attackerId,
+        killExpGain: attackerGain,
         deathAt: now,
         updatedAt: now,
         respawnRequestedAt: 0,

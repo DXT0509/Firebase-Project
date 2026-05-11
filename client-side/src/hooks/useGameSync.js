@@ -80,7 +80,7 @@ export const useGameSync = (roomId, myId) => {
         }
 
         const displayTarget = getPredictedTarget(id, target, now);
-        interpolateClientState(id, current, target, displayTarget);
+        interpolateClientState(id, current, target, displayTarget, now);
       });
 
       Object.entries(rawFoodItems.current).forEach(([id, target]) => {

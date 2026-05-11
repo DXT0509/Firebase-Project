@@ -17,7 +17,6 @@ import { db } from '../firebase/config';
 import { getRoomCollectionPath } from '../firebase/paths';
 import {
 	WORLD_SIZE,
-	PUNCH_DURATION,
 	PUNCH_COOLDOWN,
 	PUNCH_COOLDOWN_PER_LEVEL,
 	TARGET_BOT_COUNT,
@@ -25,6 +24,9 @@ import {
 	BOT_HIT_PUSH_Y,
 	BOT_ID_PREFIX,
 	RESPAWN_INVULNERABLE_MS,
+	SWING_EXTEND_DURATION,
+	SWING_RETURN_DURATION,
+	SWING_TOTAL_DURATION,
 } from '../constants/gameConfig';
 import { getLevelFromScore, getSizeFromLevel } from '../utils/physics';
 
@@ -174,6 +176,7 @@ const respawnBotPayload = (bot, now) => {
 		lastPunchHit: null,
 		isDead: false,
 		killerId: null,
+		killExpGain: 0,
 		respawnAt: 0,
 		invulnerableUntil: now + RESPAWN_INVULNERABLE_MS,
 		updatedAt: now,
@@ -209,7 +212,7 @@ const getBotPunchState = (bot, now) => {
 	const botScore = typeof bot.score === 'number' ? bot.score : 0;
 	const attackDelayMs = getBotAttackDelayMs(botScore);
 
-	const isPunching = punchStart && now - punchStart < PUNCH_DURATION;
+	const isPunching = punchStart && now - punchStart < SWING_TOTAL_DURATION;
 	if (!isPunching && now - lastPunchTime >= attackDelayMs) {
 		punchHand = nextPunchHand;
 		punchStart = now;
@@ -219,9 +222,14 @@ const getBotPunchState = (bot, now) => {
 
 	let punchProgress = 0;
 	if (punchStart) {
-		const t = Math.min(1, (now - punchStart) / PUNCH_DURATION);
-		punchProgress = t < 0.5 ? t / 0.5 : (1 - t) / 0.5;
-		if (t >= 1) {
+		const elapsed = now - punchStart;
+		if (elapsed <= SWING_EXTEND_DURATION) {
+			punchProgress = elapsed / SWING_EXTEND_DURATION;
+		} else {
+			const returnElapsed = elapsed - SWING_EXTEND_DURATION;
+			punchProgress = Math.max(0, 1 - returnElapsed / SWING_RETURN_DURATION);
+		}
+		if (elapsed >= SWING_TOTAL_DURATION) {
 			punchStart = 0;
 			punchProgress = 0;
 		}

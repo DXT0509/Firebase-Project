@@ -47,6 +47,7 @@ const normalizeClientSnapshot = (data) => {
     // Server-driven death/respawn state. Never derive these client-side.
     isDead: data.isDead === true,
     killerId: typeof data.killerId === 'string' && data.killerId.length > 0 ? data.killerId : null,
+    killExpGain: typeof data.killExpGain === 'number' ? data.killExpGain : 0,
     invulnerableUntil: typeof data.invulnerableUntil === 'number' ? data.invulnerableUntil : 0,
     updatedAt: typeof data.updatedAt === 'number' ? data.updatedAt : 0,
   };

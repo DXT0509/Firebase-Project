@@ -60,7 +60,7 @@ import { drawPlayer, drawAttackCooldownUnderLabel } from './renderer/playerRende
 import { drawGrid, drawFood } from './renderer/worldRenderer';
 import { useGameSync } from './hooks/useGameSync';
 import { buildHudState } from './utils/hudState';
-import { buildCombatHitPatches } from './utils/combat';
+import { buildCombatHitPatches, buildKillScoreDelta } from './utils/combat';
 import { consumeFoodTransaction, getFoodScoreValue } from './utils/foodConsumption';
 import GameHud from './components/GameHud';
 import RoomChatBox from './components/RoomChatBox';
@@ -71,6 +71,36 @@ import { getRoomCollectionPath } from './firebase/paths';
 import EmoteWheel from './components/EmoteWheel';
 import { EMOTE_OPTIONS, EMOTE_DURATION_MS, getEmoteById } from './constants/emotes';
 import { drawEmoteBubble } from './renderer/playerRenderer';
+
+const KILL_EXP_TEXT_DURATION_MS = 1400;
+const KILL_EXP_TEXT_FONT_SIZE = 22;
+
+const drawKillExpNotifications = (ctx, notifications, camX, camY, now) => {
+  ctx.save();
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.font = `700 ${KILL_EXP_TEXT_FONT_SIZE}px Arial`;
+  ctx.lineJoin = 'round';
+
+  notifications.forEach((notice) => {
+    const age = now - notice.createdAt;
+    const progress = Math.max(0, Math.min(1, age / KILL_EXP_TEXT_DURATION_MS));
+    const sx = notice.x + camX;
+    const sy = notice.y + camY - progress * 34;
+    const alpha = progress < 0.7 ? 1 : Math.max(0, 1 - (progress - 0.7) / 0.3);
+    const text = `+${notice.expGain} EXP`;
+
+    ctx.globalAlpha = alpha;
+    ctx.strokeStyle = 'rgba(0,0,0,0.95)';
+    ctx.lineWidth = 6;
+    ctx.strokeText(text, sx, sy);
+    ctx.fillStyle = '#facc15';
+    ctx.fillText(text, sx, sy);
+  });
+
+  ctx.restore();
+  ctx.globalAlpha = 1;
+};
 
 function App() {
   const canvasRef = useRef(null);
@@ -128,6 +158,9 @@ function App() {
   const gameStateRef = useRef('menu');
   const playerNameRef = useRef('');
   const respawnPendingRef = useRef(false);
+  const killExpNotifications = useRef([]);
+  const notifiedKillDeaths = useRef(new Set());
+  const lastAliveClientState = useRef({});
 
   const { smoothClients, foodItems, chatMessages, rawClients, rawFoodItems } = useGameSync(roomId, idRef.current);
 
@@ -556,6 +589,7 @@ function App() {
           y: Math.random() * WORLD_SIZE,
           isDead: false,
           killerId: null,
+          killExpGain: 0,
           invulnerableUntil: now + RESPAWN_INVULNERABLE_MS,
           deathAt: 0,
           updatedAt: now,
@@ -739,6 +773,45 @@ function App() {
       const myAngle = getAngle(0, 0, mousePos.current.x, mousePos.current.y);
       const mySwordAngle = moveAngle.current;
 
+      Object.entries(rawClients.current).forEach(([id, client]) => {
+        if (!client || id === idRef.current) return;
+
+        if (client.isDead !== true) {
+          lastAliveClientState.current[id] = {
+            x: typeof client.x === 'number' ? client.x : 0,
+            y: typeof client.y === 'number' ? client.y : 0,
+            score: typeof client.score === 'number' ? client.score : 0,
+          };
+          return;
+        }
+
+        const deathAt = typeof client.deathAt === 'number' ? client.deathAt : 0;
+        if (!deathAt || client.killerId !== idRef.current) return;
+
+        const deathKey = `${id}:${deathAt}`;
+        if (notifiedKillDeaths.current.has(deathKey)) return;
+
+        const lastAlive = lastAliveClientState.current[id];
+        const fallbackScore = typeof lastAlive?.score === 'number' ? lastAlive.score : client.score;
+        const expGain = typeof client.killExpGain === 'number'
+          ? client.killExpGain
+          : buildKillScoreDelta(fallbackScore).attackerGain;
+
+        killExpNotifications.current.push({
+          id,
+          deathAt,
+          x: typeof client.x === 'number' ? client.x : lastAlive?.x || 0,
+          y: typeof client.y === 'number' ? client.y : lastAlive?.y || 0,
+          expGain,
+          createdAt: now,
+        });
+        notifiedKillDeaths.current.add(deathKey);
+      });
+
+      killExpNotifications.current = killExpNotifications.current.filter(
+        (notice) => now - notice.createdAt < KILL_EXP_TEXT_DURATION_MS,
+      );
+
       // --- RENDERING ---
       drawGrid(ctx, camX, camY, canvas.width, canvas.height);
 
@@ -894,6 +967,8 @@ function App() {
         }
       }
 
+      drawKillExpNotifications(ctx, killExpNotifications.current, camX, camY, now);
+
       raf = requestAnimationFrame(gameLoop);
     };
 
@@ -966,6 +1041,9 @@ function App() {
     lastEnsureBots.current = 0;
     lastFoodSpawn.current = 0;
     lastSentState.current = null;
+    killExpNotifications.current = [];
+    notifiedKillDeaths.current = new Set();
+    lastAliveClientState.current = {};
     myScore.current = startingScore;
     lastLocalScoreMutationAt.current = Date.now();
     wasDeadLastSync.current = isRespawningFromDeath;
@@ -1000,6 +1078,7 @@ function App() {
           score: 0,
           isDead: false,
           killerId: null,
+          killExpGain: 0,
           deathAt: 0,
           invulnerableUntil: 0,
           respawnRequestedAt: 0,

@@ -11,7 +11,12 @@
  * - This module mutates `current` in place for performance.
  */
 import { useCallback } from 'react';
-import { BOT_ID_PREFIX } from '../constants/gameConfig';
+import {
+  BOT_ID_PREFIX,
+  SWING_EXTEND_DURATION,
+  SWING_RETURN_DURATION,
+  SWING_TOTAL_DURATION,
+} from '../constants/gameConfig';
 import { lerp, normalizeAngle } from '../utils/math';
 
 const POSITION_LERP = 0.55;
@@ -20,6 +25,16 @@ const COMBAT_LERP = 0.75;
 const BOT_POSITION_LERP = 0.28;
 const BOT_ANGLE_LERP = 0.24;
 const BOT_COMBAT_LERP = 0.6;
+
+const getSwingProgressAt = (punchStart, now) => {
+  if (typeof punchStart !== 'number' || punchStart <= 0) return 0;
+  const elapsed = now - punchStart;
+  if (elapsed < 0 || elapsed >= SWING_TOTAL_DURATION) return 0;
+  if (elapsed <= SWING_EXTEND_DURATION) {
+    return elapsed / SWING_EXTEND_DURATION;
+  }
+  return Math.max(0, 1 - (elapsed - SWING_EXTEND_DURATION) / SWING_RETURN_DURATION);
+};
 
 /**
  * Input:
@@ -42,7 +57,7 @@ export const useInterpolation = () => {
    * Critical rule:
    * - Do not interpolate `lastPunchTime/punchStart/...`; hit logic depends on exact values.
    */
-  const interpolateClientState = useCallback((id, current, target, displayTarget) => {
+  const interpolateClientState = useCallback((id, current, target, displayTarget, now = Date.now()) => {
     const isBot = id.startsWith(BOT_ID_PREFIX);
     const positionLerp = isBot ? BOT_POSITION_LERP : POSITION_LERP;
     const angleLerp = isBot ? BOT_ANGLE_LERP : ANGLE_LERP;
@@ -57,13 +72,22 @@ export const useInterpolation = () => {
     current.swordAngle = (current.swordAngle ?? targetSwordAngle) +
       normalizeAngle(targetSwordAngle - (current.swordAngle ?? targetSwordAngle)) * angleLerp;
 
-    current.leftPunch = lerp(current.leftPunch ?? 0, typeof target.leftPunch === 'number' ? target.leftPunch : 0, combatLerp);
-    current.rightPunch = lerp(current.rightPunch ?? 0, typeof target.rightPunch === 'number' ? target.rightPunch : 0, combatLerp);
-    current.swordSwing = lerp(
-      current.swordSwing ?? 0,
-      typeof target.swordSwing === 'number' ? target.swordSwing : Math.max(target.leftPunch || 0, target.rightPunch || 0),
-      combatLerp,
-    );
+    const targetSwing = typeof target.swordSwing === 'number' ? target.swordSwing : Math.max(target.leftPunch || 0, target.rightPunch || 0);
+    const botVisualSwing = isBot ? getSwingProgressAt(target.punchStart, now) : null;
+    const renderSwing = botVisualSwing !== null ? botVisualSwing : targetSwing;
+    const targetLeftPunch = typeof target.leftPunch === 'number' ? target.leftPunch : 0;
+    const targetRightPunch = typeof target.rightPunch === 'number' ? target.rightPunch : 0;
+
+    if (isBot) {
+      const punchHand = target.punchHand === 1 ? 1 : 0;
+      current.leftPunch = punchHand === 0 ? renderSwing : 0;
+      current.rightPunch = punchHand === 1 ? renderSwing : 0;
+      current.swordSwing = renderSwing;
+    } else {
+      current.leftPunch = lerp(current.leftPunch ?? 0, targetLeftPunch, combatLerp);
+      current.rightPunch = lerp(current.rightPunch ?? 0, targetRightPunch, combatLerp);
+      current.swordSwing = lerp(current.swordSwing ?? 0, renderSwing, combatLerp);
+    }
 
     if (typeof target.punchHand === 'number') current.punchHand = target.punchHand;
     if (typeof target.punchStart === 'number') current.punchStart = target.punchStart;
