@@ -14,7 +14,7 @@ export const WORLD_SIZE = 5000;
 export const TICK_RATE = 120; // ms
 export const LERP_FACTOR = 0.3;
 export const LERP_COMBAT_FACTOR = 0.35;
-export const PLAYER_SIZE = 60;
+export const PLAYER_SIZE = 40;
 export const DEFAULT_ROOM_ID = 'default';
 
 export const SPEED = 300;

@@ -132,6 +132,12 @@ export const useNetworkSync = ({
 
       // Emote fields are copied immediately so overlays stay responsive.
       const existing = smoothClients.current[id];
+      const respawned = previous?.isDead === true && predictedSnapshot.isDead !== true;
+      if (existing && id !== myId && respawned) {
+        smoothClients.current[id] = { ...predictedSnapshot };
+        return;
+      }
+
       if (existing && id !== myId) {
         if (!shouldAcceptClientSnapshot(existing, predictedSnapshot)) {
           return;

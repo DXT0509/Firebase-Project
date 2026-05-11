@@ -73,6 +73,12 @@ export const useGameSync = (roomId, myId) => {
           smoothClients.current[id] = { ...target };
           return;
         }
+
+        if (current.isDead === true && target.isDead !== true) {
+          smoothClients.current[id] = { ...target };
+          return;
+        }
+
         const displayTarget = getPredictedTarget(id, target, now);
         interpolateClientState(id, current, target, displayTarget);
       });

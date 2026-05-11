@@ -23,6 +23,7 @@ import {
   get as dbGet,
   remove as dbRemove,
   onDisconnect,
+  runTransaction,
 } from 'firebase/database';
 import { db } from './firebase/config';
 import { spawnFood } from './simulators/Spawn';
@@ -65,6 +66,7 @@ import GameHud from './components/GameHud';
 import RoomChatBox from './components/RoomChatBox';
 import ChatInputOverlay from './components/ChatInputOverlay';
 import MainMenu from './components/MainMenu';
+import DeathOverlay from './components/DeathOverlay';
 import { getRoomCollectionPath } from './firebase/paths';
 import EmoteWheel from './components/EmoteWheel';
 import { EMOTE_OPTIONS, EMOTE_DURATION_MS, getEmoteById } from './constants/emotes';
@@ -82,6 +84,7 @@ function App() {
   const [gameState, setGameState] = useState('menu');
   const [playerName, setPlayerName] = useState('');
   const [killerName, setKillerName] = useState(null);
+  const [menuMode, setMenuMode] = useState('menu');
   const roomId = DEFAULT_ROOM_ID;
 
   // Refs quản lý logic (không gây re-render)
@@ -101,6 +104,7 @@ function App() {
   const lastTime = useRef(0);
   const lastSent = useRef(0);
   const lastBotUpdate = useRef(0);
+  const botUpdateInFlight = useRef(false);
   const lastEnsureBots = useRef(0);
   const lastFoodSpawn = useRef(0);
   const lastSentState = useRef(null);
@@ -136,7 +140,9 @@ function App() {
   }, [playerName]);
 
   useEffect(() => {
-    if (gameState !== 'playing') return undefined;
+    // Run render loop while playing OR while dead so the world remains visible
+    // behind overlays (DeathOverlay). Skip when in menu.
+    if (gameState === 'menu') return undefined;
 
     const deathWatcher = window.setInterval(() => {
       const localRawState = rawClients.current[idRef.current];
@@ -180,7 +186,7 @@ function App() {
   }, [chatDraft]);
 
   useEffect(() => {
-    if (gameState !== 'playing') return undefined;
+    if (gameState === 'menu') return undefined;
 
     const canvas = canvasRef.current;
     if (!canvas) return undefined;
@@ -379,6 +385,42 @@ function App() {
     const hostRef = dbRef(db, getRoomCollectionPath(roomId, 'host'));
     const clientsRootRef = dbRef(db, clientsPath);
 
+    /**
+     * Input: signed score delta from local-only actions.
+     * Output: transactionally updates the authoritative score field.
+     *
+     * WHY: regular movement heartbeats must not carry stale score values that
+     * can overwrite host-awarded kill EXP before this client receives it.
+     */
+    const commitLocalScoreDelta = async (delta) => {
+      if (!Number.isFinite(delta) || delta === 0) return;
+
+      try {
+        const result = await runTransaction(userRef, (current) => {
+          if (current === null) return current;
+          const currentScore = Number.isFinite(current.score) ? current.score : 0;
+          const currentUpdatedAt = Number.isFinite(current.updatedAt) ? current.updatedAt : 0;
+          return {
+            ...current,
+            score: Math.max(0, currentScore + delta),
+            updatedAt: Math.max(currentUpdatedAt, Date.now()),
+          };
+        });
+
+        const committedValue = result.snapshot?.val();
+        const committedScore = committedValue?.score;
+        const committedUpdatedAt = committedValue?.updatedAt;
+        if (result.committed && Number.isFinite(committedScore)) {
+          myScore.current = committedScore;
+          lastLocalScoreMutationAt.current = Number.isFinite(committedUpdatedAt)
+            ? committedUpdatedAt
+            : Date.now();
+        }
+      } catch (err) {
+        console.error('score transaction error', err);
+      }
+    };
+
     // Xoá client của mình khi disconnect để tránh rác dữ liệu
     onDisconnect(userRef).remove();
 
@@ -451,9 +493,6 @@ function App() {
       const sendX = isPositionLocked && typeof mySyncState?.x === 'number' ? mySyncState.x : myWorldPos.current.x;
       const sendY = isPositionLocked && typeof mySyncState?.y === 'number' ? mySyncState.y : myWorldPos.current.y;
       const sendSwing = isAttackLocked ? 0 : swingProgress.current;
-      const sendScore = Number.isFinite(myServerScore) && isDeadFromServer
-        ? myServerScore
-        : myScore.current;
       const angle = Math.atan2(mousePos.current.y, mousePos.current.x);
       const payload = {
         x: sendX,
@@ -463,7 +502,6 @@ function App() {
         swordAngle: moveAngle.current,
         swordSwing: sendSwing,
         lastSwingTime: lastSwingTime.current,
-        score: sendScore,
         name: playerNameRef.current || idRef.current.slice(0, 4).toUpperCase(),
         boost: boostActive.current,
         lastSeen: now,
@@ -481,11 +519,10 @@ function App() {
       const swordAngleChanged = !prev || Math.abs(normalizeAngle((payload.swordAngle || 0) - (prev.swordAngle || 0))) > 0.06;
       const swingChanged = !prev || Math.abs((payload.swordSwing || 0) - (prev.swordSwing || 0)) > 0.04;
       const boostChanged = !prev || prev.boost !== payload.boost;
-      const scoreChanged = !prev || prev.score !== payload.score;
       const emoteChanged = !prev || prev.activeEmote !== payload.activeEmote || prev.emoteUntil !== payload.emoteUntil;
       const heartbeatDue = !prev || now - lastSent.current > 700;
 
-      if (movedFarEnough || angleChanged || swordAngleChanged || swingChanged || boostChanged || scoreChanged || emoteChanged || heartbeatDue) {
+      if (movedFarEnough || angleChanged || swordAngleChanged || swingChanged || boostChanged || emoteChanged || heartbeatDue) {
         lastSent.current = now;
         lastSentState.current = payload;
         dbUpdate(userRef, payload).catch((err) => {
@@ -589,12 +626,17 @@ function App() {
         }
 
         // Tick bot: cho bot di chuyển kiếm food gần nhất với tần suất thấp hơn
-        if (!lastBotUpdate.current || ts - lastBotUpdate.current > BOT_UPDATE_INTERVAL_MS) {
+        if (!botUpdateInFlight.current && (!lastBotUpdate.current || ts - lastBotUpdate.current > BOT_UPDATE_INTERVAL_MS)) {
           lastBotUpdate.current = ts;
+          botUpdateInFlight.current = true;
           // Dùng raw snapshot (authoritative) cho simulation; smooth cache chỉ dành cho render.
-          updateBotsTowardFood(rawClients.current, rawFoodItems.current, roomId).catch((err) =>
-            console.error('updateBotsTowardFood error', err),
-          );
+          updateBotsTowardFood(rawClients.current, rawFoodItems.current, roomId)
+            .catch((err) => {
+              console.error('updateBotsTowardFood error', err);
+            })
+            .finally(() => {
+              botUpdateInFlight.current = false;
+            });
         }
       }
       const dt = (ts - (lastTime.current || ts)) / 1000;
@@ -618,6 +660,7 @@ function App() {
           const actualPay = Math.min(pointsToPay, myScore.current);
           myScore.current -= actualPay;
           lastLocalScoreMutationAt.current = Date.now();
+          commitLocalScoreDelta(-actualPay);
           boostScoreAccumulator.current -= actualPay;
           if (myScore.current <= 0) {
             myScore.current = 0;
@@ -720,8 +763,10 @@ function App() {
           try {
             const result = await consumeFoodTransaction(db, roomId, foodId);
             if (result.committed) {
-              myScore.current += getFoodScoreValue(food?.size || 1);
+              const scoreDelta = getFoodScoreValue(food?.size || 1);
+              myScore.current += scoreDelta;
               lastLocalScoreMutationAt.current = Date.now();
+              commitLocalScoreDelta(scoreDelta);
             }
           } catch (err) {
             console.error('consumeFood error', err);
@@ -803,6 +848,7 @@ function App() {
           enemyLevel,
           rawClient?.invulnerableUntil || 0,
           rawClient?.isDead === true,
+          id.startsWith(BOT_ID_PREFIX) ? { shadows: false } : undefined,
         );
 
         const enemyEmote = fbClient?.activeEmote && typeof fbClient?.emoteUntil === 'number' && fbClient.emoteUntil > now
@@ -879,6 +925,8 @@ function App() {
   );
 
   const handlePlay = (nextPlayerName) => {
+    // When starting play, always reset the menu mode back to regular menu
+    setMenuMode('menu');
     const safePlayerName = String(nextPlayerName || '').trim().slice(0, 16);
     if (!safePlayerName) return;
 
@@ -968,22 +1016,33 @@ function App() {
 
   return (
     <div style={{ width: '100vw', height: '100vh', overflow: 'hidden', background: '#1a1a1a' }}>
-      {(gameState === 'menu' || gameState === 'dead') && (
+      {gameState === 'menu' && (
         <MainMenu
-          mode={gameState}
+          mode={menuMode}
           killerName={killerName}
           roomId={roomId}
           onPlay={handlePlay}
         />
       )}
 
-      {gameState === 'playing' && (
+      {gameState === 'dead' && (
+        <DeathOverlay
+          visible={true}
+          killerName={killerName}
+          onRespawn={() => {
+            setMenuMode('dead');
+            setGameState('menu');
+          }}
+        />
+      )}
+
+      {(gameState === 'playing' || gameState === 'dead') && (
         <>
           <canvas ref={canvasRef} style={{ display: 'block', pointerEvents: 'none' }} />
-          <GameHud hud={hudState} />
+          {gameState === 'playing' && <GameHud hud={hudState} />}
           <RoomChatBox messages={chatMessages} />
           <EmoteWheel visible={isEmoteWheelOpen} center={emoteWheelCenter} hoveredIndex={emoteHoveredIndex} />
-          {isChatInputOpen && (
+          {isChatInputOpen && gameState === 'playing' && (
             <ChatInputOverlay
               value={chatDraft}
               onChange={(e) => setChatDraft(e.target.value)}

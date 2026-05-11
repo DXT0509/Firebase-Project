@@ -328,7 +328,7 @@ function MainMenu({ mode = 'menu', killerName, roomId, onPlay }) {
           <h1 style={menuStyles.title}>ARENA SYNC</h1>
           <p style={menuStyles.tagline}>Survive. Grow. Dominate.</p>
 
-          <form style={menuStyles.form} onSubmit={submit}>
+          <form style={menuStyles.form} onSubmit={submit} autoComplete="off">
             <input
               ref={inputRef}
               value={playerName}
@@ -336,6 +336,10 @@ function MainMenu({ mode = 'menu', killerName, roomId, onPlay }) {
               onChange={(event) => {
                 setPlayerName(event.target.value.slice(0, 16));
                 if (error) setError('');
+              }}
+              onKeyDown={(e) => {
+                // Prevent Enter from auto-submitting (some browsers / autofill can trigger submit)
+                if (e.key === 'Enter') e.preventDefault();
               }}
               placeholder="Nhập tên của bạn"
               style={{
@@ -345,7 +349,8 @@ function MainMenu({ mode = 'menu', killerName, roomId, onPlay }) {
             />
             <div style={menuStyles.error}>{error}</div>
             <button
-              type="submit"
+              type="button"
+              onClick={submit}
               onMouseEnter={() => setIsPlayHovered(true)}
               onMouseLeave={() => setIsPlayHovered(false)}
               style={{

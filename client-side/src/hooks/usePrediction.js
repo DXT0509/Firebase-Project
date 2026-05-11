@@ -36,8 +36,9 @@ export const usePrediction = (myId) => {
   const applyPredictionToSnapshot = useCallback((id, normalized, previous) => {
     const now = Date.now();
     const isBot = id.startsWith(BOT_ID_PREFIX);
+    const respawned = previous?.isDead === true && normalized.isDead !== true;
 
-    if (!isBot && id !== myId && previous && typeof previous.x === 'number' && typeof previous.y === 'number') {
+    if (!isBot && id !== myId && !respawned && previous && typeof previous.x === 'number' && typeof previous.y === 'number') {
       const prevRecvTs = typeof previous.__recvTs === 'number' ? previous.__recvTs : now;
       const dtMs = Math.max(1, now - prevRecvTs);
       const dtSec = dtMs / 1000;

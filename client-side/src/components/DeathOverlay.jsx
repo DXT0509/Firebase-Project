@@ -8,7 +8,7 @@
  * Key concepts:
  * - Pure UI component; game loop and authoritative logic stay outside.
  */
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 
 /**
  * Inputs:
@@ -20,6 +20,22 @@ import React from 'react';
  * - Fullscreen overlay JSX when visible.
  */
 function DeathOverlay({ visible, killerName, onRespawn }) {
+  const [entered, setEntered] = useState(false);
+
+  useEffect(() => {
+    if (!visible) {
+      setEntered(false);
+      return undefined;
+    }
+
+    // Trigger enter animation on next frame
+    let raf = 0;
+    raf = requestAnimationFrame(() => setEntered(true));
+    return () => {
+      cancelAnimationFrame(raf);
+    };
+  }, [visible]);
+
   if (!visible) return null;
 
   const safeKillerName = killerName || 'Unknown';
@@ -49,6 +65,9 @@ function DeathOverlay({ visible, killerName, onRespawn }) {
           textAlign: 'center',
           fontFamily: 'system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
           pointerEvents: 'auto',
+          transform: entered ? 'translateY(0) scale(1)' : 'translateY(-28vh) scale(0.98)',
+          opacity: entered ? 1 : 0,
+          transition: 'transform 1040ms cubic-bezier(0.22,0.85,0.22,1), opacity 360ms ease',
         }}
       >
         <div style={{ fontSize: 28, fontWeight: 800, marginBottom: 10 }}>You Died</div>
