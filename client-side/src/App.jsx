@@ -25,6 +25,7 @@ import {
   onDisconnect,
   onValue,
   runTransaction,
+  serverTimestamp,
 } from 'firebase/database';
 import { db } from './firebase/config';
 import { spawnFood } from './simulators/Spawn';
@@ -72,11 +73,11 @@ import { getRoomCollectionPath } from './firebase/paths';
 import EmoteWheel from './components/EmoteWheel';
 import { EMOTE_OPTIONS, EMOTE_DURATION_MS, getEmoteById } from './constants/emotes';
 import { drawEmoteBubble } from './renderer/playerRenderer';
+import { HOST_HEARTBEAT_INTERVAL_MS, HOST_EXPIRY_MS, HOST_CHECK_INTERVAL_MS } from './constants/host';
 
 const KILL_EXP_TEXT_DURATION_MS = 1400;
 const KILL_EXP_TEXT_FONT_SIZE = 22;
-const HOST_STALE_MS = 3000;
-const HOST_HEARTBEAT_MS = 1000;
+// Host timing constants are in constants/host.js
 
 const drawKillExpNotifications = (ctx, notifications, camX, camY, now) => {
   ctx.save();
@@ -149,6 +150,10 @@ function App() {
   const boostActive = useRef(false);
   const boostScoreAccumulator = useRef(0);
   const isHost = useRef(false); // chỉ host mới chạy bot AI + spawn food
+  const heartbeatIntervalRef = useRef(null);
+  const hostCheckIntervalRef = useRef(null);
+  const combatIntervalRef = useRef(null);
+  const hostIdUnsubscribeRef = useRef(null);
   const lastUiRefresh = useRef(0);
   const chatInputOpenRef = useRef(false);
   const chatDraftRef = useRef('');
@@ -479,90 +484,145 @@ function App() {
       }
     };
 
-    const claimHostIfFree = async () => {
-      if (document.visibilityState !== 'visible') {
-        if (isHost.current) {
-          clearOwnedHost();
-        }
-        return;
+    // Host election/heartbeat is managed by tryClaimHost/startHostIntervals logic below
+
+    // Interval refs are declared at top-level (near other refs)
+
+    const startHostIntervals = async () => {
+      if (isHost.current) return;
+      isHost.current = true;
+
+      // Immediately write a heartbeat with server timestamp and register onDisconnect cleanup
+      try {
+        await dbUpdate(hostRef, { id: idRef.current, ts: serverTimestamp() });
+        await onDisconnect(hostRef).remove();
+      } catch (err) {
+        // onDisconnect may fail in some environments; continue regardless
+        console.error('startHostIntervals onDisconnect/register error', err);
       }
+
+      // Heartbeat: update host.ts periodically using server timestamp
+      heartbeatIntervalRef.current = setInterval(() => {
+        if (!isHost.current) return;
+        dbUpdate(hostRef, { id: idRef.current, ts: serverTimestamp() }).catch((err) => {
+          console.error('host heartbeat error', err);
+        });
+      }, HOST_HEARTBEAT_INTERVAL_MS);
+
+      // Combat loop: only active on host
+      combatIntervalRef.current = setInterval(() => {
+        if (!isHost.current) return;
+        const now = Date.now();
+        const combatPatches = buildCombatHitPatches(rawClients.current, now);
+        const writeEntries = Object.entries(combatPatches);
+        Promise.all([
+          ...writeEntries.map(([id, patch]) => dbUpdate(dbRef(db, `${clientsPath}/${id}`), patch)),
+          processAuthoritativeRespawns(),
+        ]).catch((err) => {
+          console.error('authoritative combat loop error', err);
+        });
+      }, 50);
+
+      // Watch for being replaced as host: if host/id changes to another id, stop intervals
+      hostIdUnsubscribeRef.current = onValue(dbRef(db, `${getRoomCollectionPath(roomId, 'host')}/id`), (snapshot) => {
+        const currentHostId = snapshot.val();
+        if (currentHostId && currentHostId !== idRef.current && isHost.current) {
+          // Another client claimed host — relinquish
+          stopHostIntervals();
+        }
+      });
+    };
+
+    const stopHostIntervals = async () => {
+      // Clear heartbeat + combat intervals
+      try {
+        if (heartbeatIntervalRef.current) {
+          clearInterval(heartbeatIntervalRef.current);
+          heartbeatIntervalRef.current = null;
+        }
+        if (combatIntervalRef.current) {
+          clearInterval(combatIntervalRef.current);
+          combatIntervalRef.current = null;
+        }
+
+        // Cancel any onDisconnect removal to avoid races
+        await onDisconnect(hostRef).cancel().catch(() => {});
+
+        if (hostIdUnsubscribeRef.current) {
+          hostIdUnsubscribeRef.current();
+          hostIdUnsubscribeRef.current = null;
+        }
+      } catch (err) {
+        console.error('stopHostIntervals error', err);
+      } finally {
+        isHost.current = false;
+      }
+    };
+
+    // Try to claim host using a transaction that checks expiry
+    const tryClaimHost = async () => {
+      if (document.visibilityState !== 'visible') return false;
 
       try {
         const now = Date.now();
-        const clientsSnap = await dbGet(clientsRootRef);
-        const clients = clientsSnap.val() || {};
-
-        let ownsAfterTransaction = false;
         const result = await runTransaction(hostRef, (current) => {
-          const hostMissing = !current || !current.id;
-          const hostClientMissing = current?.id ? !clients[current.id] : true;
-          const hostStale = typeof current?.ts === 'number' ? now - current.ts > HOST_STALE_MS : true;
-
-          if (current?.id === idRef.current || hostMissing || hostClientMissing || hostStale) {
-            ownsAfterTransaction = true;
-            return { id: idRef.current, ts: now };
+          const isExpired = !current?.ts || (now - current.ts) > HOST_EXPIRY_MS;
+          const isAbandoned = !current?.id;
+          if (isExpired || isAbandoned) {
+            return { id: idRef.current, ts: serverTimestamp() };
           }
-
-          ownsAfterTransaction = false;
-          return current;
+          return; // abort
         });
 
         const committedHost = result.snapshot?.val();
-        isHost.current = ownsAfterTransaction && committedHost?.id === idRef.current;
-
-        onDisconnect(hostRef).cancel().catch(() => {});
+        const claimed = result.committed && committedHost?.id === idRef.current;
+        if (claimed) {
+          // Start host-only loops
+          await startHostIntervals();
+        }
+        return claimed;
       } catch (err) {
-        console.error('claimHostIfFree error', err);
+        console.error('tryClaimHost error', err);
+        return false;
       }
     };
 
-    // Lần đầu vào game: thử trở thành host
-    claimHostIfFree();
+    // Initial attempt to claim host on mount
+    tryClaimHost();
 
-    // Định kỳ vài giây kiểm tra nếu hiện tại không có host
-    const hostPoll = setInterval(() => {
-      if (document.visibilityState !== 'visible') {
-        if (isHost.current) {
-          clearOwnedHost();
+    // Periodically check host liveness and try to claim if expired
+    hostCheckIntervalRef.current = setInterval(async () => {
+      if (isHost.current) return;
+      if (document.visibilityState !== 'visible') return;
+
+      try {
+        const snap = await dbGet(hostRef);
+        const hostData = snap.val();
+        const isDead = !hostData?.ts || (Date.now() - hostData.ts) > HOST_EXPIRY_MS;
+        if (isDead) {
+          const claimed = await tryClaimHost();
+          if (claimed) {
+            // startHostIntervals already called inside tryClaimHost
+          }
         }
-        return;
+      } catch (err) {
+        console.error('host liveness check error', err);
       }
-
-      if (isHost.current) {
-        const now = Date.now();
-        runTransaction(hostRef, (current) => {
-          if (!current || current.id !== idRef.current) return current;
-          return { id: idRef.current, ts: now };
-        }).catch((err) => {
-          console.error('host heartbeat error', err);
-        });
-      }
-      // Always re-check host ownership so hidden/stale host tabs can be replaced.
-      claimHostIfFree();
-    }, HOST_HEARTBEAT_MS);
+    }, HOST_CHECK_INTERVAL_MS);
 
     const handleVisibilityChange = () => {
       if (document.visibilityState === 'visible') {
-        claimHostIfFree();
+        tryClaimHost();
       } else if (isHost.current) {
-        clearOwnedHost();
+        // Give up host immediately when tab hidden to avoid split-brain on background tabs
+        stopHostIntervals();
+        // Also try to clear host record in db if we own it
+        runTransaction(hostRef, (current) => {
+          if (!current || current.id !== idRef.current) return current;
+          return null;
+        }).catch(() => {});
       }
     };
-
-    document.addEventListener('visibilitychange', handleVisibilityChange);
-
-    const unsubscribeHostWatch = onValue(hostRef, (snap) => {
-      if (document.visibilityState !== 'visible') return;
-      const current = snap.val();
-      const hostMissing = !current || !current.id;
-      const hostStale = typeof current?.ts === 'number'
-        ? Date.now() - current.ts > HOST_STALE_MS
-        : true;
-
-      if (hostMissing || hostStale) {
-        claimHostIfFree();
-      }
-    });
 
     // Performance-sensitive sender loop: keep network updates independent from render throttling.
     const networkPoll = setInterval(() => {
@@ -679,17 +739,7 @@ function App() {
     };
 
     // Keep combat resolution off render loop; host applies authoritative kill updates.
-    const combatPoll = setInterval(() => {
-      const now = Date.now();
-      const combatPatches = buildCombatHitPatches(rawClients.current, now);
-      const writeEntries = Object.entries(combatPatches);
-      Promise.all([
-        ...writeEntries.map(([id, patch]) => dbUpdate(dbRef(db, `${clientsPath}/${id}`), patch)),
-        processAuthoritativeRespawns(),
-      ]).catch((err) => {
-        console.error('authoritative combat loop error', err);
-      });
-    }, 50);
+    // Combat loop is started/stopped by host control (startHostIntervals/stopHostIntervals).
 
     /** Input: entity + timestamp. Output: whether entity is currently invulnerable. */
     const isEntityInvulnerable = (entity, currentNow) => {
@@ -1043,14 +1093,19 @@ function App() {
       window.removeEventListener('keyup', handleKeyUp);
       window.removeEventListener('contextmenu', handleContextMenu);
       document.removeEventListener('visibilitychange', handleVisibilityChange);
-      unsubscribeHostWatch();
+      // Stop host intervals and host check loop
+      stopHostIntervals().catch(() => {});
+      if (hostCheckIntervalRef.current) {
+        clearInterval(hostCheckIntervalRef.current);
+        hostCheckIntervalRef.current = null;
+      }
       cancelAnimationFrame(raf);
       if (gameStateRef.current !== 'dead') {
         dbRemove(userRef);
       }
-      clearInterval(hostPoll);
+      
       clearInterval(networkPoll);
-      clearInterval(combatPoll);
+      
     };
   }, [gameState, foodItems, rawClients, rawFoodItems, roomId, smoothClients]);
 
