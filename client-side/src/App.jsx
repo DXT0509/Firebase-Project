@@ -23,6 +23,7 @@ import {
   get as dbGet,
   remove as dbRemove,
   onDisconnect,
+  onValue,
   runTransaction,
 } from 'firebase/database';
 import { db } from './firebase/config';
@@ -74,6 +75,8 @@ import { drawEmoteBubble } from './renderer/playerRenderer';
 
 const KILL_EXP_TEXT_DURATION_MS = 1400;
 const KILL_EXP_TEXT_FONT_SIZE = 22;
+const HOST_STALE_MS = 3000;
+const HOST_HEARTBEAT_MS = 1000;
 
 const drawKillExpNotifications = (ctx, notifications, camX, camY, now) => {
   ctx.save();
@@ -464,25 +467,50 @@ function App() {
      * Critical rule:
      * - Host election heartbeat must stay resilient; bot/food simulation depends on it.
      */
+    const clearOwnedHost = async () => {
+      isHost.current = false;
+      try {
+        await runTransaction(hostRef, (current) => {
+          if (!current || current.id !== idRef.current) return current;
+          return null;
+        });
+      } catch (err) {
+        console.error('clearOwnedHost error', err);
+      }
+    };
+
     const claimHostIfFree = async () => {
+      if (document.visibilityState !== 'visible') {
+        if (isHost.current) {
+          clearOwnedHost();
+        }
+        return;
+      }
+
       try {
         const now = Date.now();
-        const [hostSnap, clientsSnap] = await Promise.all([dbGet(hostRef), dbGet(clientsRootRef)]);
-        const current = hostSnap.val();
+        const clientsSnap = await dbGet(clientsRootRef);
         const clients = clientsSnap.val() || {};
 
-        const hostMissing = !current || !current.id;
-        const hostClientMissing = current?.id ? !clients[current.id] : true;
-        const hostStale = typeof current?.ts === 'number' ? now - current.ts > 15000 : true;
+        let ownsAfterTransaction = false;
+        const result = await runTransaction(hostRef, (current) => {
+          const hostMissing = !current || !current.id;
+          const hostClientMissing = current?.id ? !clients[current.id] : true;
+          const hostStale = typeof current?.ts === 'number' ? now - current.ts > HOST_STALE_MS : true;
 
-        if (hostMissing || hostClientMissing || hostStale) {
-          await dbSet(hostRef, { id: idRef.current, ts: now });
-          isHost.current = true;
-          // Tự giải phóng role host khi tab bị đóng
-          onDisconnect(hostRef).remove();
-        } else {
-          isHost.current = current.id === idRef.current;
-        }
+          if (current?.id === idRef.current || hostMissing || hostClientMissing || hostStale) {
+            ownsAfterTransaction = true;
+            return { id: idRef.current, ts: now };
+          }
+
+          ownsAfterTransaction = false;
+          return current;
+        });
+
+        const committedHost = result.snapshot?.val();
+        isHost.current = ownsAfterTransaction && committedHost?.id === idRef.current;
+
+        onDisconnect(hostRef).cancel().catch(() => {});
       } catch (err) {
         console.error('claimHostIfFree error', err);
       }
@@ -493,14 +521,48 @@ function App() {
 
     // Định kỳ vài giây kiểm tra nếu hiện tại không có host
     const hostPoll = setInterval(() => {
-      if (isHost.current && document.visibilityState === 'visible') {
-        dbSet(hostRef, { id: idRef.current, ts: Date.now() }).catch((err) => {
+      if (document.visibilityState !== 'visible') {
+        if (isHost.current) {
+          clearOwnedHost();
+        }
+        return;
+      }
+
+      if (isHost.current) {
+        const now = Date.now();
+        runTransaction(hostRef, (current) => {
+          if (!current || current.id !== idRef.current) return current;
+          return { id: idRef.current, ts: now };
+        }).catch((err) => {
           console.error('host heartbeat error', err);
         });
       }
       // Always re-check host ownership so hidden/stale host tabs can be replaced.
       claimHostIfFree();
-    }, 5000);
+    }, HOST_HEARTBEAT_MS);
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        claimHostIfFree();
+      } else if (isHost.current) {
+        clearOwnedHost();
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
+    const unsubscribeHostWatch = onValue(hostRef, (snap) => {
+      if (document.visibilityState !== 'visible') return;
+      const current = snap.val();
+      const hostMissing = !current || !current.id;
+      const hostStale = typeof current?.ts === 'number'
+        ? Date.now() - current.ts > HOST_STALE_MS
+        : true;
+
+      if (hostMissing || hostStale) {
+        claimHostIfFree();
+      }
+    });
 
     // Performance-sensitive sender loop: keep network updates independent from render throttling.
     const networkPoll = setInterval(() => {
@@ -921,7 +983,6 @@ function App() {
           enemyLevel,
           rawClient?.invulnerableUntil || 0,
           rawClient?.isDead === true,
-          id.startsWith(BOT_ID_PREFIX) ? { shadows: false } : undefined,
         );
 
         const enemyEmote = fbClient?.activeEmote && typeof fbClient?.emoteUntil === 'number' && fbClient.emoteUntil > now
@@ -981,6 +1042,8 @@ function App() {
       window.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('keyup', handleKeyUp);
       window.removeEventListener('contextmenu', handleContextMenu);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      unsubscribeHostWatch();
       cancelAnimationFrame(raf);
       if (gameStateRef.current !== 'dead') {
         dbRemove(userRef);

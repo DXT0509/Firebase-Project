@@ -29,7 +29,7 @@ export const KNOCKBACK_Y = 100;
 export const RESPAWN_DELAY_MS = 1200;
 export const RESPAWN_INVULNERABLE_MS = 3000;
 
-export const BOT_UPDATE_INTERVAL_MS = 40;
+export const BOT_UPDATE_INTERVAL_MS = 80;
 export const BOT_ENSURE_INTERVAL_MS = 5000;
 export const FOOD_SPAWN_INTERVAL_MS = 1000;
 
