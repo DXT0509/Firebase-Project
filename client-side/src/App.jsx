@@ -1135,6 +1135,7 @@ function App() {
     const startingScore = isRespawningFromDeath && typeof localRawState?.score === 'number'
       ? localRawState.score
       : 0;
+    const startingKills = typeof localRawState?.kills === 'number' ? localRawState.kills : 0;
 
     playerNameRef.current = safePlayerName;
     setPlayerName(safePlayerName);
@@ -1184,6 +1185,7 @@ function App() {
       activeEmote: null,
       emoteAt: 0,
       emoteUntil: 0,
+      kills: startingKills,
       ...(isRespawningFromDeath
         ? {
           respawnRequestedAt: now,

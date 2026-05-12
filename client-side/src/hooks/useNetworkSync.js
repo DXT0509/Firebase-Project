@@ -44,6 +44,7 @@ const normalizeClientSnapshot = (data) => {
     activeEmote: typeof data.activeEmote === 'string' && data.activeEmote.length > 0 ? data.activeEmote : null,
     emoteUntil: typeof data.emoteUntil === 'number' ? data.emoteUntil : 0,
     emoteAt: typeof data.emoteAt === 'number' ? data.emoteAt : 0,
+    kills: typeof data.kills === 'number' ? data.kills : 0,
     // Server-driven death/respawn state. Never derive these client-side.
     isDead: data.isDead === true,
     killerId: typeof data.killerId === 'string' && data.killerId.length > 0 ? data.killerId : null,

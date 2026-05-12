@@ -82,7 +82,7 @@ function GameHud({ hud }) {
         <div style={{ display: 'flex', fontWeight: 600, opacity: 0.7, marginBottom: 4 }}>
           <div style={{ width: 24, textAlign: 'left' }}>#</div>
           <div style={{ flex: 1, textAlign: 'left' }}>Name</div>
-          <div style={{ width: 60, textAlign: 'right' }}>Score</div>
+          <div style={{ width: 60, textAlign: 'right' }}>Kills</div>
         </div>
 
         {hud.leaderboardRows.map((row) => {
@@ -157,7 +157,7 @@ function GameHud({ hud }) {
                   {row.name}
                 </span>
               </div>
-              <div style={{ width: 60, textAlign: 'right' }}>{row.score}</div>
+              <div style={{ width: 60, textAlign: 'right' }}>☠ {row.kills}</div>
             </div>
           );
         })}

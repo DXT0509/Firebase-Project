@@ -106,9 +106,13 @@ export const buildCombatHitPatches = (rawClients, now) => {
       const attackerScoreBase = Number.isFinite((mergedUpdates[attackerId] || {}).score)
         ? (mergedUpdates[attackerId] || {}).score
         : attackerScoreForGeometry;
+      const attackerKillsBase = Number.isFinite((mergedUpdates[attackerId] || {}).kills)
+        ? (mergedUpdates[attackerId] || {}).kills
+        : (Number.isFinite(attacker.kills) ? attacker.kills : 0);
       mergedUpdates[attackerId] = {
         ...(mergedUpdates[attackerId] || {}),
         score: attackerScoreBase + attackerGain,
+        kills: attackerKillsBase + 1,
         updatedAt: now,
         [memoKey]: hitMemo,
       };
