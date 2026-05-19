@@ -39,15 +39,18 @@ export const buildHudState = (
     id,
     name: c?.name || id.slice(0, 4).toUpperCase(),
     score: typeof c?.score === 'number' ? c.score : 0,
+    kills: typeof c?.kills === 'number' ? c.kills : 0,
   }));
 
-  const sortedByScore = [...clientsArray].sort((a, b) => b.score - a.score);
+  const sortedByKills = [...clientsArray].sort(
+    (a, b) => (b.kills - a.kills) || (b.score - a.score),
+  );
   const rankMap = {};
-  sortedByScore.forEach((c, idx) => {
+  sortedByKills.forEach((c, idx) => {
     rankMap[c.id] = idx + 1;
   });
 
-  const myIndex = sortedByScore.findIndex((c) => c.id === myId);
+  const myIndex = sortedByKills.findIndex((c) => c.id === myId);
   const syncedScore = safeClients?.[myId]?.score;
   const myScoreValue = typeof syncedScore === 'number' ? syncedScore : fallbackScore;
 
@@ -69,13 +72,13 @@ export const buildHudState = (
 
   // Keep leaderboard compact while preserving local player context.
   let leaderboardRows = [];
-  if (sortedByScore.length <= 5) {
-    leaderboardRows = sortedByScore;
+  if (sortedByKills.length <= 5) {
+    leaderboardRows = sortedByKills;
   } else if (myIndex !== -1 && myIndex < 4) {
-    leaderboardRows = sortedByScore.slice(0, 5);
+    leaderboardRows = sortedByKills.slice(0, 5);
   } else {
-    const top4 = sortedByScore.slice(0, 4);
-    const meRow = sortedByScore.find((c) => c.id === myId);
+    const top4 = sortedByKills.slice(0, 4);
+    const meRow = sortedByKills.find((c) => c.id === myId);
     leaderboardRows = meRow ? [...top4, meRow] : top4;
   }
 
