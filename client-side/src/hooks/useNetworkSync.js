@@ -15,6 +15,7 @@ import { useEffect } from 'react';
 import { onChildAdded, onChildChanged, onChildRemoved, ref as dbRef } from 'firebase/database';
 import { db } from '../firebase/config';
 import { getRoomCollectionPath } from '../firebase/paths';
+import { recordMoveLatency, startLatencyLogging, stopLatencyLogging } from '../firebase/latencyMeter';
 
 /**
  * Input:
@@ -50,6 +51,8 @@ const normalizeClientSnapshot = (data) => {
     killExpGain: typeof data.killExpGain === 'number' ? data.killExpGain : 0,
     invulnerableUntil: typeof data.invulnerableUntil === 'number' ? data.invulnerableUntil : 0,
     updatedAt: typeof data.updatedAt === 'number' ? data.updatedAt : 0,
+    moveSeq: typeof data.moveSeq === 'number' ? data.moveSeq : 0,
+    moveSentAt: typeof data.moveSentAt === 'number' ? data.moveSentAt : 0,
   };
 };
 
@@ -91,6 +94,8 @@ export const useNetworkSync = ({
   applyPredictionToSnapshot,
 }) => {
   useEffect(() => {
+    startLatencyLogging();
+
     const clientsPath = getRoomCollectionPath(roomId, 'clients');
     const foodPath = getRoomCollectionPath(roomId, 'food');
     const chatPath = getRoomCollectionPath(roomId, 'chat');
@@ -123,10 +128,24 @@ export const useNetworkSync = ({
       const normalized = normalizeClientSnapshot(data);
       const previous = rawClients.current[id];
       const predictedSnapshot = applyPredictionToSnapshot(id, normalized, previous);
+      const hadRawCurrent = Boolean(rawClients.current[id]);
 
       const rawCurrent = rawClients.current[id];
       if (rawCurrent && !shouldAcceptClientSnapshot(rawCurrent, predictedSnapshot)) {
         return;
+      }
+
+      if (hadRawCurrent && id !== myId) {
+        recordMoveLatency({
+          senderId: id,
+          moveSeq: predictedSnapshot.moveSeq,
+          moveSentAt: predictedSnapshot.moveSentAt,
+        });
+        try {
+          window.__latencyMeter = window.__latencyMeter || {};
+          window.__latencyMeter._lastRemoteSnapshotId = id;
+          window.__latencyMeter._lastRemoteSnapshotAt = Date.now();
+        } catch (e) {}
       }
 
       rawClients.current[id] = predictedSnapshot;
@@ -236,6 +255,7 @@ export const useNetworkSync = ({
       unsubscribeChatAdded();
       unsubscribeChatChanged();
       unsubscribeChatRemoved();
+      stopLatencyLogging();
     };
   }, [roomId, myId, applyPredictionToSnapshot, smoothClients, foodItems, rawClients, rawFoodItems, rawChatItems, setChatMessages]);
 };

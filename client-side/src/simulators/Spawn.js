@@ -14,6 +14,7 @@ import { ref as dbRef, set as dbSet, get } from 'firebase/database';
 import { db } from '../firebase/config';
 import { TARGET_FOOD_COUNT, WORLD_SIZE } from '../constants/gameConfig';
 import { getRoomCollectionPath } from '../firebase/paths';
+import { incrementDbWrites } from '../firebase/writeMeter';
 
 /** Output: random HSL color string for food marker variety. */
 const randomColor = () => {
@@ -84,6 +85,8 @@ export const spawnFood = async (roomId) => {
 
 	if (created > 0) {
 		// Ghi thêm các food mới vào Firebase, giữ lại food cũ
+ 		// count this as one write
+ 		incrementDbWrites(1);
 		await dbSet(foodRef, {
 			...existing,
 			...updates,

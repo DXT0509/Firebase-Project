@@ -28,6 +28,7 @@ import {
   serverTimestamp,
 } from 'firebase/database';
 import { db } from './firebase/config';
+import { incrementDbWrites } from './firebase/writeMeter';
 import { spawnFood } from './simulators/Spawn';
 import { ensureBots, updateBotsTowardFood } from './simulators/Bot';
 import {
@@ -137,6 +138,8 @@ function App() {
 
   const lastTime = useRef(0);
   const lastSent = useRef(0);
+  const lastMoveSentAt = useRef(0);
+  const moveSeq = useRef(0);
   const lastBotUpdate = useRef(0);
   const botUpdateInFlight = useRef(false);
   const lastEnsureBots = useRef(0);
@@ -252,6 +255,8 @@ function App() {
       const now = Date.now();
       activeEmoteRef.current = emoteId;
       activeEmoteUntilRef.current = now + EMOTE_DURATION_MS;
+      // count this outgoing update
+      incrementDbWrites(1);
       dbUpdate(dbRef(db, `${getRoomCollectionPath(roomId, 'clients')}/${idRef.current}`), {
         activeEmote: emoteId,
         emoteAt: now,
@@ -370,6 +375,8 @@ function App() {
           idRef.current.slice(0, 4).toUpperCase();
         const chatRef = dbRef(db, getRoomCollectionPath(roomId, 'chat'));
         const messageRef = dbPush(chatRef);
+        // count chat send
+        incrementDbWrites(1);
         dbSet(messageRef, {
           text: trimmed,
           senderId: idRef.current,
@@ -437,6 +444,8 @@ function App() {
       if (!Number.isFinite(delta) || delta === 0) return;
 
       try {
+        // count score transaction attempt
+        incrementDbWrites(1);
         const result = await runTransaction(userRef, (current) => {
           if (current === null) return current;
           const currentScore = Number.isFinite(current.score) ? current.score : 0;
@@ -475,6 +484,8 @@ function App() {
     const clearOwnedHost = async () => {
       isHost.current = false;
       try {
+        // count host clear transaction attempt
+        incrementDbWrites(1);
         await runTransaction(hostRef, (current) => {
           if (!current || current.id !== idRef.current) return current;
           return null;
@@ -494,6 +505,8 @@ function App() {
 
       // Immediately write a heartbeat with server timestamp and register onDisconnect cleanup
       try {
+        // count initial host claim update
+        incrementDbWrites(1);
         await dbUpdate(hostRef, { id: idRef.current, ts: serverTimestamp() });
         await onDisconnect(hostRef).remove();
       } catch (err) {
@@ -504,6 +517,8 @@ function App() {
       // Heartbeat: update host.ts periodically using server timestamp
       heartbeatIntervalRef.current = setInterval(() => {
         if (!isHost.current) return;
+        // count heartbeat write
+        incrementDbWrites(1);
         dbUpdate(hostRef, { id: idRef.current, ts: serverTimestamp() }).catch((err) => {
           console.error('host heartbeat error', err);
         });
@@ -515,6 +530,8 @@ function App() {
         const now = Date.now();
         const combatPatches = buildCombatHitPatches(rawClients.current, now);
         const writeEntries = Object.entries(combatPatches);
+        // count per-entity combat writes
+        if (writeEntries.length) incrementDbWrites(writeEntries.length);
         Promise.all([
           ...writeEntries.map(([id, patch]) => dbUpdate(dbRef(db, `${clientsPath}/${id}`), patch)),
           processAuthoritativeRespawns(),
@@ -565,6 +582,8 @@ function App() {
 
       try {
         const now = Date.now();
+        // count host claim transaction attempt
+        incrementDbWrites(1);
         const result = await runTransaction(hostRef, (current) => {
           const isExpired = !current?.ts || (now - current.ts) > HOST_EXPIRY_MS;
           const isAbandoned = !current?.id;
@@ -617,6 +636,8 @@ function App() {
         // Give up host immediately when tab hidden to avoid split-brain on background tabs
         stopHostIntervals();
         // Also try to clear host record in db if we own it
+        // count host clear transaction attempt from visibility change
+        incrementDbWrites(1);
         runTransaction(hostRef, (current) => {
           if (!current || current.id !== idRef.current) return current;
           return null;
@@ -664,6 +685,8 @@ function App() {
         activeEmote: activeEmoteRef.current,
         emoteAt: activeEmoteRef.current ? Math.max(0, activeEmoteUntilRef.current - EMOTE_DURATION_MS) : 0,
         emoteUntil: activeEmoteRef.current ? activeEmoteUntilRef.current : 0,
+        moveSeq: moveSeq.current,
+        moveSentAt: lastMoveSentAt.current,
       };
 
       const prev = lastSentState.current;
@@ -679,7 +702,15 @@ function App() {
 
       if (movedFarEnough || angleChanged || swordAngleChanged || swingChanged || boostChanged || emoteChanged || heartbeatDue) {
         lastSent.current = now;
+        if (movedFarEnough) {
+          moveSeq.current += 1;
+          lastMoveSentAt.current = now;
+          payload.moveSeq = moveSeq.current;
+          payload.moveSentAt = lastMoveSentAt.current;
+        }
         lastSentState.current = payload;
+        // count network heartbeat/update
+        incrementDbWrites(1);
         dbUpdate(userRef, payload).catch((err) => {
           console.error('network sync error', err);
         });
@@ -731,6 +762,8 @@ function App() {
       const entries = Object.entries(respawnUpdates);
       if (!entries.length) return;
 
+      // count respawn writes
+      if (entries.length) incrementDbWrites(entries.length);
       await Promise.all(
         entries.map(([id, patch]) =>
           dbUpdate(dbRef(db, `${clientsPath}/${id}`), patch),
@@ -1101,6 +1134,8 @@ function App() {
       }
       cancelAnimationFrame(raf);
       if (gameStateRef.current !== 'dead') {
+        // count explicit client removal
+        incrementDbWrites(1);
         dbRemove(userRef);
       }
       
@@ -1173,6 +1208,8 @@ function App() {
     respawnPendingRef.current = isRespawningFromDeath;
 
     const clientsPath = getRoomCollectionPath(roomId, 'clients');
+    // count initial client state write on play
+    incrementDbWrites(1);
     dbUpdate(dbRef(db, `${clientsPath}/${idRef.current}`), {
       name: safePlayerName,
       color: colorRef.current,
@@ -1184,6 +1221,8 @@ function App() {
       activeEmote: null,
       emoteAt: 0,
       emoteUntil: 0,
+      moveSeq: 0,
+      moveSentAt: 0,
       ...(isRespawningFromDeath
         ? {
           respawnRequestedAt: now,

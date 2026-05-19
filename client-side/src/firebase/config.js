@@ -11,6 +11,7 @@
  */
 import { initializeApp } from "firebase/app";
 import { getDatabase } from "firebase/database"; // Thêm dòng này để dùng Realtime Database
+import { startWriteLogging } from './writeMeter';
 
 const firebaseConfig = {
   apiKey: "AIzaSyAe0BRmVMTYz-bPbTKxnTRz4_v2odDCn1g",
@@ -30,3 +31,6 @@ const app = initializeApp(firebaseConfig);
 // Khởi tạo Realtime Database và export để các file khác (services) sử dụng
 export const db = getDatabase(app);
 export default app;
+
+// Start write/sec logging in browser to help profiling DB write rate.
+startWriteLogging();

@@ -15,6 +15,7 @@
 import { ref as dbRef, get, set as dbSet, update as dbUpdate, remove as dbRemove } from 'firebase/database';
 import { db } from '../firebase/config';
 import { getRoomCollectionPath } from '../firebase/paths';
+import { incrementDbWrites } from '../firebase/writeMeter';
 import {
 	WORLD_SIZE,
 	PUNCH_COOLDOWN,
@@ -385,6 +386,8 @@ export const ensureBots = async (roomId) => {
 	}
 
 	// Ghi từng bot mới theo per-entity path để giảm kích thước mỗi lần ghi
+	const updateCount = Object.keys(updates).length;
+	if (updateCount) incrementDbWrites(updateCount);
 	await Promise.all(
 		Object.entries(updates).map(([id, payload]) =>
 			dbSet(dbRef(db, `${clientsPath}/${id}`), payload),
@@ -582,6 +585,8 @@ export const updateBotsTowardFood = async (allClientsOverride, allFoodOverride, 
 		foodId ? dbRemove(dbRef(db, `${foodPath}/${foodId}`)) : Promise.resolve(),
 	);
 
+	const writeCount = botWrites.length + foodDeletes.length;
+	if (writeCount) incrementDbWrites(writeCount);
 	await Promise.all([...botWrites, ...foodDeletes]);
 };
 

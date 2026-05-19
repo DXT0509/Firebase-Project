@@ -19,6 +19,7 @@ import {
   WORLD_SIZE,
 } from '../constants/gameConfig';
 import { getRoomCollectionPath } from '../firebase/paths';
+import { incrementDbWrites } from '../firebase/writeMeter';
 
 /** Output: random world-space position inside bounds. */
 const getRandomSpawnPosition = () => ({
@@ -79,5 +80,7 @@ export const ensureShieldPowerups = async (roomId) => {
     writes.push(dbSet(dbRef(db, `${powerupsPath}/${id}`), payload));
   }
 
+  // count number of writes we're about to perform
+  if (writes.length) incrementDbWrites(writes.length);
   await Promise.all(writes);
 };

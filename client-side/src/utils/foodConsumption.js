@@ -1,5 +1,6 @@
 import { ref as dbRef, runTransaction } from 'firebase/database';
 import { getRoomCollectionPath } from '../firebase/paths';
+import { incrementDbWrites } from '../firebase/writeMeter';
 
 export const getFoodScoreValue = (size) => {
 	if (size === 1) return 8;
@@ -9,7 +10,9 @@ export const getFoodScoreValue = (size) => {
 
 export const consumeFoodTransaction = async (db, roomId, foodId) => {
 	const foodRef = dbRef(db, `${getRoomCollectionPath(roomId, 'food')}/${foodId}`);
-	return runTransaction(foodRef, (currentData) => {
+    // count attempted transaction as a write attempt
+    incrementDbWrites(1);
+    return runTransaction(foodRef, (currentData) => {
 		if (currentData === null) {
 			return undefined;
 		}
