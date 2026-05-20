@@ -12,7 +12,7 @@
  * - Simulation runs on raw snapshots (not smoothed render state).
  * - All writes are room-scoped; root-path writes will desync rooms.
  */
-import { ref as dbRef, get, set as dbSet, update as dbUpdate, remove as dbRemove } from 'firebase/database';
+import { ref as dbRef, get, set as dbSet, remove as dbRemove } from 'firebase/database';
 import { db } from '../firebase/config';
 import { getRoomCollectionPath } from '../firebase/paths';
 import { incrementDbWrites } from '../firebase/writeMeter';
@@ -22,14 +22,13 @@ import {
 	PUNCH_COOLDOWN_PER_LEVEL,
 	TARGET_BOT_COUNT,
 	BOT_SPEED,
-	BOT_HIT_PUSH_Y,
 	BOT_ID_PREFIX,
 	RESPAWN_INVULNERABLE_MS,
 	SWING_EXTEND_DURATION,
 	SWING_RETURN_DURATION,
 	SWING_TOTAL_DURATION,
 } from '../constants/gameConfig';
-import { getLevelFromScore, getSizeFromLevel } from '../utils/physics';
+import { getLevelFromScore } from '../utils/physics';
 
 // Performance-sensitive: persisted between ticks to keep speed frame-rate independent.
 let lastBotSimTs = 0;
@@ -265,6 +264,9 @@ const withBotCombatPose = (bot, angle, punchState) => {
 /** Input: coordinate value. Output: value clamped to world bounds. */
 const clampWorld = (value) => Math.max(0, Math.min(WORLD_SIZE, value));
 
+const MIN_BOT_SIM_DT = 0.016;
+const MAX_BOT_SIM_DT = 0.08;
+
 /** Input: entity + timestamp. Output: whether entity is currently invulnerable. */
 const isEntityInvulnerable = (entity, now) => {
 	if (!entity) return false;
@@ -305,46 +307,6 @@ const sanitizeBotForDb = (bot) => {
 };
 
 /**
- * Inputs:
- * - attacker and target entities.
- *
- * Output:
- * - Whether target body intersects attacker sword segment this tick.
- */
-const isSwordSegmentHit = (attacker, target) => {
-	if (!attacker || !target) return false;
-	if (
-		typeof attacker.x !== 'number' ||
-		typeof attacker.y !== 'number' ||
-		typeof target.x !== 'number' ||
-		typeof target.y !== 'number'
-	) {
-		return false;
-	}
-
-	const swingProgress = Math.max(0, Math.min(1, Number(attacker.swordSwing) || 0));
-	if (swingProgress <= 0) return false;
-
-	const attackerScore = Number.isFinite(attacker.score) ? attacker.score : 0;
-	const targetScore = Number.isFinite(target.score) ? target.score : 0;
-	const attackerSize = getSizeFromLevel(getLevelFromScore(attackerScore));
-	const targetSize = getSizeFromLevel(getLevelFromScore(targetScore));
-	const swordAngle = typeof attacker.swordAngle === 'number' ? attacker.swordAngle : (typeof attacker.angle === 'number' ? attacker.angle : 0);
-	const sword = getSwordWorldPoints(attacker.x, attacker.y, swordAngle, attackerSize, swingProgress, 'left');
-	const distanceToBlade = getPointToSegmentDistance(
-		target.x,
-		target.y,
-		sword.handX,
-		sword.handY,
-		sword.tipX,
-		sword.tipY,
-	);
-	const targetBodyRadius = targetSize / 2;
-
-	return distanceToBlade <= targetBodyRadius + sword.impactRadius;
-};
-
-/**
  * Input: roomId.
  * Output: none (side effect writes missing bots to Firebase).
  *
@@ -359,11 +321,6 @@ export const ensureBots = async (roomId) => {
 
 	// Tách người chơi thật và bot
 	const botEntries = Object.entries(allClients).filter(([id]) => id.startsWith(BOT_ID_PREFIX));
-	const humanEntries = Object.entries(allClients).filter(([id]) => !id.startsWith(BOT_ID_PREFIX));
-
-	// Giữ nguyên người thật, chỉ thao tác trên bot
-	const humanClients = Object.fromEntries(humanEntries);
-	const currentBots = Object.fromEntries(botEntries);
 	const currentBotCount = botEntries.length;
 
 	if (currentBotCount >= TARGET_BOT_COUNT) {
@@ -462,7 +419,8 @@ export const updateBotsTowardFood = async (allClientsOverride, allFoodOverride, 
 
 	const now = Date.now();
 	if (!lastBotSimTs) lastBotSimTs = now;
-	const simDt = Math.max(0.016, (now - lastBotSimTs) / 1000); // tối thiểu ~1 frame
+	const elapsedSec = (now - lastBotSimTs) / 1000;
+	const simDt = Math.max(MIN_BOT_SIM_DT, Math.min(MAX_BOT_SIM_DT, elapsedSec));
 	lastBotSimTs = now;
 	const botStep = BOT_SPEED * simDt;
 	const updatedBots = { ...botClients };

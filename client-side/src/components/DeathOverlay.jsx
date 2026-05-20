@@ -14,19 +14,17 @@ import React, { useEffect, useState } from 'react';
  * Inputs:
  * - visible: whether overlay is shown.
  * - killerName: display name of the killer.
+ * - isRespawnRequested: whether the authoritative respawn request is pending.
  * - onRespawn: callback invoked when Respawn button is clicked.
  *
  * Output:
  * - Fullscreen overlay JSX when visible.
  */
-function DeathOverlay({ visible, killerName, onRespawn }) {
+function DeathOverlay({ visible, killerName, isRespawnRequested = false, onRespawn }) {
   const [entered, setEntered] = useState(false);
 
   useEffect(() => {
-    if (!visible) {
-      setEntered(false);
-      return undefined;
-    }
+    if (!visible) return undefined;
 
     // Trigger enter animation on next frame
     let raf = 0;
@@ -77,20 +75,22 @@ function DeathOverlay({ visible, killerName, onRespawn }) {
         <button
           type="button"
           onClick={onRespawn}
+          disabled={isRespawnRequested}
           style={{
             minWidth: 140,
             height: 40,
             borderRadius: 999,
             border: 'none',
-            cursor: 'pointer',
+            cursor: isRespawnRequested ? 'default' : 'pointer',
             fontSize: 14,
             fontWeight: 700,
             color: '#0f172a',
             background: 'linear-gradient(135deg, #facc15, #fb7185)',
             boxShadow: '0 8px 20px rgba(250, 204, 21, 0.28)',
+            opacity: isRespawnRequested ? 0.7 : 1,
           }}
         >
-          Respawn
+          {isRespawnRequested ? 'Respawning...' : 'Respawn'}
         </button>
       </div>
     </div>

@@ -1,9 +1,25 @@
-import { BOT_ID_PREFIX, MAX_LEVEL } from '../constants/gameConfig';
+import {
+  BOT_ID_PREFIX,
+  MAX_LEVEL,
+  SWING_EXTEND_DURATION,
+  SWING_RETURN_DURATION,
+  SWING_TOTAL_DURATION,
+} from '../constants/gameConfig';
 import { getLevelFromScore, getScoreFloorForLevel, getSizeFromLevel, getSwordWorldPoints } from './physics';
 import { getPointToSegmentDistance } from './math';
 
 const MIN_KILL_EXP_GAIN = 100;
 const MAX_LEVEL_SCORE_FLOOR = getScoreFloorForLevel(MAX_LEVEL);
+
+const getSwingProgressAt = (swingStart, now) => {
+  if (typeof swingStart !== 'number' || swingStart <= 0) return 0;
+  const elapsed = now - swingStart;
+  if (elapsed < 0 || elapsed >= SWING_TOTAL_DURATION) return 0;
+  if (elapsed <= SWING_EXTEND_DURATION) {
+    return elapsed / SWING_EXTEND_DURATION;
+  }
+  return Math.max(0, 1 - (elapsed - SWING_EXTEND_DURATION) / SWING_RETURN_DURATION);
+};
 
 export const buildKillScoreDelta = (victimScore) => {
   const safeVictimScore = Math.max(0, Number.isFinite(victimScore) ? victimScore : 0);
@@ -44,9 +60,11 @@ export const buildCombatHitPatches = (rawClients, now) => {
     if (isInvulnerable(attacker)) return;
 
     const isBot = attackerId.startsWith(BOT_ID_PREFIX);
-    const swingProgress = typeof attacker.swordSwing === 'number'
-      ? attacker.swordSwing
-      : Math.max(attacker.leftPunch || 0, attacker.rightPunch || 0);
+    const swingProgress = isBot
+      ? getSwingProgressAt(attacker.punchStart, now)
+      : (typeof attacker.swordSwing === 'number'
+        ? attacker.swordSwing
+        : Math.max(attacker.leftPunch || 0, attacker.rightPunch || 0));
     if (swingProgress <= 0) return;
 
     const swingStamp = isBot

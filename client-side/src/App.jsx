@@ -120,7 +120,9 @@ function App() {
   const [playerName, setPlayerName] = useState('');
   const [killerName, setKillerName] = useState(null);
   const [menuMode, setMenuMode] = useState('menu');
+  const [isRespawnRequested, setIsRespawnRequested] = useState(false);
   const roomId = DEFAULT_ROOM_ID;
+  const isWorldActive = gameState !== 'menu';
 
   // Refs quản lý logic (không gây re-render)
   const myWorldPos = useRef({ x: WORLD_SIZE / 2, y: WORLD_SIZE / 2 });
@@ -186,17 +188,28 @@ function App() {
   useEffect(() => {
     // Run render loop while playing OR while dead so the world remains visible
     // behind overlays (DeathOverlay). Skip when in menu.
-    if (gameState === 'menu') return undefined;
+    if (!isWorldActive) return undefined;
 
     const deathWatcher = window.setInterval(() => {
       const localRawState = rawClients.current[idRef.current];
       if (!localRawState) return;
       if (localRawState.isDead !== true) {
         respawnPendingRef.current = false;
+        setIsRespawnRequested(false);
+        if (gameStateRef.current === 'dead') {
+          if (typeof localRawState.x === 'number' && typeof localRawState.y === 'number') {
+            myWorldPos.current = { x: localRawState.x, y: localRawState.y };
+          }
+          swingStart.current = 0;
+          swingProgress.current = 0;
+          gameStateRef.current = 'playing';
+          setGameState('playing');
+        }
         return;
       }
       if (respawnPendingRef.current) return;
 
+      setIsRespawnRequested(false);
       const killerId = localRawState.killerId || null;
       const killerRawState = killerId ? rawClients.current[killerId] : null;
       const nextKillerName = killerRawState?.name
@@ -213,7 +226,7 @@ function App() {
     return () => {
       window.clearInterval(deathWatcher);
     };
-  }, [gameState, rawClients]);
+  }, [isWorldActive, rawClients]);
 
   // Keep chat input focus behavior deterministic across open/close cycles.
   useEffect(() => {
@@ -230,7 +243,7 @@ function App() {
   }, [chatDraft]);
 
   useEffect(() => {
-    if (gameState === 'menu') return undefined;
+    if (!isWorldActive) return undefined;
 
     const canvas = canvasRef.current;
     if (!canvas) return undefined;
@@ -737,15 +750,17 @@ function App() {
         if (!respawnRequestedAt) return;
         if (!deathAt || now - deathAt < RESPAWN_DELAY_MS) return;
 
+        const entityUpdatedAt = typeof entity.updatedAt === 'number' ? entity.updatedAt : 0;
+        const patchUpdatedAt = Math.max(now, entityUpdatedAt + 1);
         respawnUpdates[id] = {
           x: Math.random() * WORLD_SIZE,
           y: Math.random() * WORLD_SIZE,
           isDead: false,
           killerId: null,
           killExpGain: 0,
-          invulnerableUntil: now + RESPAWN_INVULNERABLE_MS,
+          invulnerableUntil: patchUpdatedAt + RESPAWN_INVULNERABLE_MS,
           deathAt: 0,
-          updatedAt: now,
+          updatedAt: patchUpdatedAt,
           respawnRequestedAt: 0,
           score: typeof entity.score === 'number' ? entity.score : 0,
           swordSwing: 0,
@@ -1142,7 +1157,7 @@ function App() {
       clearInterval(networkPoll);
       
     };
-  }, [gameState, foodItems, rawClients, rawFoodItems, roomId, smoothClients]);
+  }, [isWorldActive, foodItems, rawClients, rawFoodItems, roomId, smoothClients]);
 
   const hudState = buildHudState(
     smoothClients.current,
@@ -1252,6 +1267,36 @@ function App() {
     setGameState('playing');
   };
 
+  const requestRespawn = () => {
+    const localRawState = rawClients.current[idRef.current];
+    if (!localRawState || localRawState.isDead !== true || respawnPendingRef.current) return;
+
+    const now = Date.now();
+    respawnPendingRef.current = true;
+    setIsRespawnRequested(true);
+    setIsChatInputOpen(false);
+    setIsEmoteWheelOpen(false);
+    swingStart.current = 0;
+    swingProgress.current = 0;
+
+    const clientsPath = getRoomCollectionPath(roomId, 'clients');
+    incrementDbWrites(1);
+    dbUpdate(dbRef(db, `${clientsPath}/${idRef.current}`), {
+      respawnRequestedAt: now,
+      swordSwing: 0,
+      leftPunch: 0,
+      rightPunch: 0,
+      lastSwingTime: 0,
+      boost: false,
+      lastSeen: now,
+      updatedAt: now,
+    }).catch((err) => {
+      respawnPendingRef.current = false;
+      setIsRespawnRequested(false);
+      console.error('respawn request error', err);
+    });
+  };
+
   return (
     <div style={{ width: '100vw', height: '100vh', overflow: 'hidden', background: '#1a1a1a' }}>
       {gameState === 'menu' && (
@@ -1267,10 +1312,8 @@ function App() {
         <DeathOverlay
           visible={true}
           killerName={killerName}
-          onRespawn={() => {
-            setMenuMode('dead');
-            setGameState('menu');
-          }}
+          isRespawnRequested={isRespawnRequested}
+          onRespawn={requestRespawn}
         />
       )}
 
